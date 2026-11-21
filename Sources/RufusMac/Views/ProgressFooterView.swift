@@ -7,15 +7,30 @@ struct ProgressFooterView: View {
         VStack(spacing: 10) {
             // Status & Progress Bar Area
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
+                HStack(alignment: .top, spacing: 8) {
                     statusIcon
+                        .padding(.top, 2)
                     Text(statusHeadline)
                         .font(.system(size: 12.5, weight: .semibold))
                         .foregroundStyle(statusColor)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                        .lineLimit(isFailedState ? 3 : 1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
 
-                    Spacer()
+                    Spacer(minLength: 8)
+
+                    if isFailedState && !vm.showLogDrawer {
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                                vm.showLogDrawer = true
+                            }
+                        } label: {
+                            Label(vm.t("Protokoll", "Log"), systemImage: "terminal")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
 
                     if vm.isRunning {
                         if let speed = vm.speedMBps, speed > 0.1 {
@@ -137,6 +152,11 @@ struct ProgressFooterView: View {
         case .completed, .cancelled, .failed: return true
         default: return false
         }
+    }
+
+    private var isFailedState: Bool {
+        if case .failed = vm.runState { return true }
+        return false
     }
 
     private var displayFraction: Double {

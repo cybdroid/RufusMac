@@ -252,10 +252,18 @@ final class AppViewModel: ObservableObject {
     }
 
     private func applySmartDefaults(for analysis: ISOAnalysis) {
-        // Suggest smart volume label
-        let rawLabel = analysis.volumeName.isEmpty
-            ? URL(fileURLWithPath: analysis.filePath).deletingPathExtension().lastPathComponent
-            : analysis.volumeName
+        // Choose a clean, human-readable default volume label (avoiding cryptic UDF codes like CCCOMA_X64FRE or tmp names)
+        let fileBase = URL(fileURLWithPath: analysis.filePath).deletingPathExtension().lastPathComponent
+        let volUpper = analysis.volumeName.uppercased()
+        let isCrypticVolume = volUpper.isEmpty
+            || volUpper.hasPrefix("DMG.")
+            || volUpper.hasPrefix("RUFUSMAC-ISO")
+            || volUpper.hasPrefix("CCCOMA_")
+            || volUpper.hasPrefix("ESD-ISO")
+            || volUpper.hasPrefix("J_CCSA")
+            || volUpper.hasPrefix("SSS_")
+        let rawLabel = isCrypticVolume ? fileBase : analysis.volumeName
+
         if analysis.kind == .windowsISO {
             writeMode = .isoFileCopy
             if analysis.installEsdExceedsFAT32 {
@@ -269,7 +277,6 @@ final class AppViewModel: ObservableObject {
             writeMode = .ddRawImage
             volumeLabel = VolumeLabelSanitizer.sanitize(rawLabel, for: fileSystem)
         } else if analysis.kind == .linuxHybridISO {
-            // Hybrid Linux ISOs work great in DD mode OR ISO copy mode; default to DD if hybrid MBR exists and not Windows
             writeMode = analysis.hasHybridMBR ? .ddRawImage : .isoFileCopy
             if !FileSystemType.bootableCases.contains(fileSystem) {
                 fileSystem = .fat32

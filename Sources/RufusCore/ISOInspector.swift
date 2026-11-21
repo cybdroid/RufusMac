@@ -13,19 +13,78 @@ public enum ISOInspectorError: LocalizedError {
     }
 }
 
-public struct MountedImageInfo {
+public struct MountedImageInfo: Sendable {
     public let deviceNode: String
     public let mountPoint: String
-    public let tempMountDir: String
+    public let tempMountDir: String?
+    public let volumeName: String
+    public let shouldDetachOnCleanup: Bool
 }
 
 public final class ISOInspector {
 
-    /// Mounts an ISO read-only in an isolated private temporary mount directory (never collides with /Volumes).
-    public static func attachReadOnly(isoPath: String) throws -> MountedImageInfo {
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("rufusmac-mnt-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    /// Checks `hdiutil info -plist` to see if `isoPath` is already mounted (e.g. user double-clicked it in Finder).
+    /// Reusing an existing mount avoids `hdiutil: attach failed - Resource busy`.
+    public static func findExistingMount(isoPath: String) -> MountedImageInfo? {
+        let targetReal = URL(fileURLWithPath: isoPath).resolvingSymlinksInPath().standardizedFileURL.path
+        guard let data = try? DiskDiscovery.runProcess("/usr/bin/hdiutil", arguments: ["info", "-plist"]) else {
+            return nil
+        }
+        let xmlStart = data.range(of: Data("<?xml".utf8))
+        let plistData = xmlStart.map { data.subdata(in: $0.lowerBound..<data.endIndex) } ?? data
+        guard let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
+              let images = plist["images"] as? [[String: Any]] else {
+            return nil
+        }
+
+        for img in images {
+            guard let path = img["image-path"] as? String else { continue }
+            let imgReal = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+            guard imgReal == targetReal else { continue }
+            guard let entities = img["system-entities"] as? [[String: Any]] else { continue }
+            for entity in entities {
+                if let mp = entity["mount-point"] as? String, !mp.isEmpty,
+                   let dev = entity["dev-entry"] as? String, !dev.isEmpty,
+                   FileManager.default.fileExists(atPath: mp) {
+                    let volName = queryVolumeName(for: dev) ?? URL(fileURLWithPath: mp).lastPathComponent
+                    return MountedImageInfo(
+                        deviceNode: dev,
+                        mountPoint: mp,
+                        tempMountDir: nil,
+                        volumeName: volName,
+                        shouldDetachOnCleanup: false
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Queries the real UDF / ISO9660 volume name from diskutil.
+    public static func queryVolumeName(for deviceNode: String) -> String? {
+        guard let data = try? DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", deviceNode]),
+              let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let name = dict["VolumeName"] as? String,
+              !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Mounts an ISO read-only in a world-traversable `/tmp/rufusmac-iso-<UUID>` mountpoint (never collides with /Volumes,
+    /// and cleanly readable by both GUI user and privileged helper). Reuses an existing mount if already attached.
+    public static func attachReadOnly(isoPath: String, preferReuseExisting: Bool = true) throws -> MountedImageInfo {
+        if preferReuseExisting, let existing = findExistingMount(isoPath: isoPath) {
+            return existing
+        }
+
+        let mountDir = URL(fileURLWithPath: "/private/tmp")
+            .appendingPathComponent("rufusmac-iso-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: mountDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
@@ -35,7 +94,7 @@ public final class ISOInspector {
             "-nobrowse",
             "-noverify",
             "-noautoopen",
-            "-mountrandom", tempDir.path,
+            "-mountpoint", mountDir.path,
             "-plist",
             isoPath
         ]
@@ -50,18 +109,17 @@ public final class ISOInspector {
         process.waitUntilExit()
 
         guard process.terminationStatus == 0 else {
-            try? FileManager.default.removeItem(at: tempDir)
+            try? FileManager.default.removeItem(at: mountDir)
             let errStr = String(data: errData, encoding: .utf8) ?? "hdiutil exit \(process.terminationStatus)"
             throw ISOInspectorError.attachFailed(errStr.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        // hdiutil may print warnings before <?xml; locate plist start
         let xmlStart = outData.range(of: Data("<?xml".utf8))
         let plistData = xmlStart.map { outData.subdata(in: $0.lowerBound..<outData.endIndex) } ?? outData
 
         guard let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
               let entities = plist["system-entities"] as? [[String: Any]] else {
-            try? FileManager.default.removeItem(at: tempDir)
+            try? FileManager.default.removeItem(at: mountDir)
             throw ISOInspectorError.attachFailed("Ungültige hdiutil-Antwort.")
         }
 
@@ -76,22 +134,34 @@ public final class ISOInspector {
                 break
             }
         }
-        // Fallback: whole disk entry
         if chosenDev == nil {
             chosenDev = entities.first?["dev-entry"] as? String
         }
 
         guard let dev = chosenDev, let mount = chosenMount else {
-            // Detach anything partially attached
             if let dev = chosenDev {
-                detach(deviceNode: dev, tempMountDir: tempDir.path)
+                detach(deviceNode: dev, tempMountDir: mountDir.path)
             } else {
-                try? FileManager.default.removeItem(at: tempDir)
+                try? FileManager.default.removeItem(at: mountDir)
             }
             throw ISOInspectorError.attachFailed("Kein lesbares Dateisystem im ISO gefunden.")
         }
 
-        return MountedImageInfo(deviceNode: dev, mountPoint: mount, tempMountDir: tempDir.path)
+        let realVolName = queryVolumeName(for: dev)
+            ?? URL(fileURLWithPath: isoPath).deletingPathExtension().lastPathComponent
+
+        return MountedImageInfo(
+            deviceNode: dev,
+            mountPoint: mount,
+            tempMountDir: mountDir.path,
+            volumeName: realVolName,
+            shouldDetachOnCleanup: true
+        )
+    }
+
+    public static func detach(_ mounted: MountedImageInfo) {
+        guard mounted.shouldDetachOnCleanup else { return }
+        detach(deviceNode: mounted.deviceNode, tempMountDir: mounted.tempMountDir)
     }
 
     public static func detach(deviceNode: String, tempMountDir: String? = nil) {
@@ -128,7 +198,6 @@ public final class ISOInspector {
             let mbr = fh.readData(ofLength: 512)
             try? fh.close()
             if mbr.count == 512 && mbr[510] == 0x55 && mbr[511] == 0xAA {
-                // Verify at least one non-zero partition entry or boot code
                 let hasPart = (446..<510).contains { mbr[$0] != 0 }
                 let hasCode = (0..<440).contains { mbr[$0] != 0 }
                 hasHybridMBR = hasPart && hasCode
@@ -160,18 +229,17 @@ public final class ISOInspector {
         // Try mounting ISO to inspect contents
         do {
             let mounted = try attachReadOnly(isoPath: filePath)
-            defer { detach(deviceNode: mounted.deviceNode, tempMountDir: mounted.tempMountDir) }
+            defer { detach(mounted) }
 
             return inspectMountedDirectory(
                 mountPoint: mounted.mountPoint,
                 filePath: filePath,
                 fileName: fileName,
                 fileSize: fileSize,
-                hasHybridMBR: hasHybridMBR
+                hasHybridMBR: hasHybridMBR,
+                volumeNameOverride: mounted.volumeName
             )
         } catch {
-            // If an .iso cannot be mounted by macOS (e.g., some Linux hybrid images with unusual layouts),
-            // classify cleanly so the user can still flash it in DD Image Mode!
             let baseName = url.deletingPathExtension().lastPathComponent
             return ISOAnalysis(
                 filePath: filePath,
@@ -199,11 +267,12 @@ public final class ISOInspector {
         filePath: String,
         fileName: String,
         fileSize: Int64,
-        hasHybridMBR: Bool
+        hasHybridMBR: Bool,
+        volumeNameOverride: String? = nil
     ) -> ISOAnalysis {
         let fm = FileManager.default
         let mountURL = URL(fileURLWithPath: mountPoint)
-        let volumeName = mountURL.lastPathComponent
+        let volumeName = volumeNameOverride ?? mountURL.lastPathComponent
 
         var hasBootWim = false
         var hasBootmgr = false
@@ -285,14 +354,14 @@ public final class ISOInspector {
             || (hasBootmgr && hasSetupExe)
 
         let lowerName = fileName.lowercased()
-        let isWin11Likely = isWindows && (
+        let isExplicitWin10 = lowerName.contains("win10") || lowerName.contains("windows10") || lowerName.contains("windows_10") || lowerName.contains("windows 10")
+        let isWin11Likely = isWindows && !isExplicitWin10 && (
             lowerName.contains("win11") ||
             lowerName.contains("windows11") ||
             lowerName.contains("windows_11") ||
             lowerName.contains("windows 11") ||
             lowerName.contains("24h2") ||
             lowerName.contains("23h2") ||
-            lowerName.contains("22h2") ||
             lowerName.contains("25h2") ||
             hasAppraiserRes
         )
@@ -325,7 +394,7 @@ public final class ISOInspector {
         )
     }
 
-    /// Computes MD5, SHA-1, and SHA-256 in a single streaming pass (low memory footprint even for 7 GB ISOs).
+    /// Computes MD5, SHA-1, and SHA-256 in a single streaming pass.
     public static func computeChecksums(
         filePath: String,
         progress: @escaping (Double) -> Void
@@ -342,7 +411,7 @@ public final class ISOInspector {
         var sha1 = Insecure.SHA1()
         var sha256 = SHA256()
 
-        let chunkSize = 4 * 1024 * 1024 // 4 MB chunks
+        let chunkSize = 4 * 1024 * 1024
         var processed: Int64 = 0
         var lastReport = Date.distantPast
 

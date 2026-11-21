@@ -196,7 +196,7 @@ public enum ClusterSize: Int, CaseIterable, Identifiable, Codable, Sendable {
 
     public func displayName(isGerman: Bool) -> String {
         switch self {
-        case .automatic: return isGerman ? "Standard (Automatisch)" : "Default (Automatic)"
+        case .automatic: return isGerman ? "Standard (Auto)" : "Default (Auto)"
         case .kb4: return "4096 Bytes (4 KB)"
         case .kb8: return "8192 Bytes (8 KB)"
         case .kb16: return "16 KB"
@@ -335,6 +335,9 @@ public struct FlashJobConfig: Codable, Sendable {
     public let bootMode: BootSelectionMode
     public let writeMode: WriteMode
     public let isoPath: String?
+    public let preMountedISOPath: String?       // Mounted by GUI user to avoid root TCC restrictions on ~/Downloads
+    public let rawFifoPath: String?             // Named pipe streamed by GUI user for DD mode without TCC issues
+    public let rawInputSizeBytes: Int64?        // Exact byte size of source file when streaming via rawFifoPath
     public let isoKind: DetectedImageKind?
     public let partitionScheme: PartitionScheme
     public let fileSystem: FileSystemType
@@ -352,6 +355,9 @@ public struct FlashJobConfig: Codable, Sendable {
         bootMode: BootSelectionMode,
         writeMode: WriteMode,
         isoPath: String?,
+        preMountedISOPath: String? = nil,
+        rawFifoPath: String? = nil,
+        rawInputSizeBytes: Int64? = nil,
         isoKind: DetectedImageKind?,
         partitionScheme: PartitionScheme,
         fileSystem: FileSystemType,
@@ -368,6 +374,9 @@ public struct FlashJobConfig: Codable, Sendable {
         self.bootMode = bootMode
         self.writeMode = writeMode
         self.isoPath = isoPath
+        self.preMountedISOPath = preMountedISOPath
+        self.rawFifoPath = rawFifoPath
+        self.rawInputSizeBytes = rawInputSizeBytes
         self.isoKind = isoKind
         self.partitionScheme = partitionScheme
         self.fileSystem = fileSystem

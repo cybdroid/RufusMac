@@ -293,7 +293,15 @@ struct ISOSectionView: View {
     private func kindTitle(for a: ISOAnalysis) -> String {
         switch a.kind {
         case .windowsISO:
-            let ver = a.isWindows11Likely ? "Windows 11 / 10" : "Windows ISO"
+            let lower = a.fileName.lowercased()
+            let ver: String
+            if lower.contains("win10") || lower.contains("windows10") || lower.contains("windows_10") {
+                ver = "Windows 10"
+            } else if a.isWindows11Likely {
+                ver = "Windows 11"
+            } else {
+                ver = "Windows ISO"
+            }
             let arch = a.windowsArchitecture.map { " (\($0))" } ?? ""
             return "\(ver)\(arch)"
         case .linuxHybridISO:

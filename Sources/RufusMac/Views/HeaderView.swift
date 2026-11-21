@@ -1,20 +1,34 @@
 import SwiftUI
+import AppKit
 
 struct HeaderView: View {
     @ObservedObject var vm: AppViewModel
 
     var body: some View {
         HStack(spacing: 12) {
-            // Custom layered brand mark
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(RufusTheme.brandIconGradient)
-                    .frame(width: 40, height: 40)
-                    .shadow(color: RufusTheme.accentBlue.opacity(0.35), radius: 8, x: 0, y: 3)
-
-                Image(systemName: "externaldrive.fill.badge.bolt")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.white)
+            // Crisp brand icon (uses rendered macOS AppIcon with layered SwiftUI fallback)
+            Group {
+                if let appIcon = NSApp.applicationIconImage {
+                    Image(nsImage: appIcon)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: 44, height: 44)
+                        .shadow(color: RufusTheme.accentBlue.opacity(0.28), radius: 6, x: 0, y: 2)
+                } else {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(RufusTheme.brandIconGradient)
+                            .frame(width: 40, height: 40)
+                        Image(systemName: "externaldrive.fill")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.white)
+                            .offset(x: -2, y: -1)
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 11, weight: .black))
+                            .foregroundStyle(.yellow)
+                            .offset(x: 9, y: 8)
+                    }
+                }
             }
 
             VStack(alignment: .leading, spacing: 2) {

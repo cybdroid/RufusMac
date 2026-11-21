@@ -64,7 +64,7 @@ struct PartitionFileSystemView: View {
                                 .pickerStyle(.menu)
                                 .disabled(vm.isRunning || vm.fileSystem == .apfs || vm.fileSystem == .hfsPlus)
                             }
-                            .frame(width: 175, alignment: .leading)
+                            .frame(width: 192, alignment: .leading)
                         }
 
                         // Contextual filesystem explanation

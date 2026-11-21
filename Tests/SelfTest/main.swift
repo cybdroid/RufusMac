@@ -218,13 +218,18 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     let diskId = DiskDiscovery.wholeDiskIdentifier(from: devNode)
     defer { ISOInspector.detach(deviceNode: devNode) }
 
-    // A) GPT + FAT32 + autounattend.xml
+    // A) GPT + FAT32 + autounattend.xml (using TCC-safe preMountedISOPath flow!)
+    let preMounted = try ISOInspector.attachReadOnly(isoPath: isoURL.path)
+    defer { ISOInspector.detach(preMounted) }
+    try assertEqual(preMounted.volumeName, "WIN11_TEST", "Real UDF VolumeName must be extracted, not temp dir name!")
+
     var eventsA: [FlashProgressEvent] = []
     try FlashEngine(emit: { eventsA.append($0) }, isCancelled: { false }).execute(config: FlashJobConfig(
         targetDeviceIdentifier: diskId,
         bootMode: .isoOrImage,
         writeMode: .isoFileCopy,
         isoPath: isoURL.path,
+        preMountedISOPath: preMounted.mountPoint,
         isoKind: .windowsISO,
         partitionScheme: .gpt,
         fileSystem: .fat32,
@@ -243,7 +248,7 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/efi/boot/bootx64.efi"), "Missing bootx64.efi on GPT FAT32")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/sources/install.wim"), "Missing install.wim on GPT FAT32")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/autounattend.xml"), "Missing autounattend.xml on GPT FAT32")
-    print("         [sub-check] GPT + FAT32 + autounattend.xml OK")
+    print("         [sub-check] GPT + FAT32 + preMountedISOPath + autounattend.xml OK")
 
     // B) GPT Dual-Partition (FAT32 Boot + ExFAT Data)
     var eventsB: [FlashProgressEvent] = []
@@ -311,16 +316,35 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     try assertEqual(sector0[446], 0x80, "MBR Partition 1 active flag must be 0x80")
     print("         [sub-check] MBR + Windows NT6 MBR/VBR + Active Flag 0x80 OK")
 
-    // D) DD Raw Image Mode
+    // D) DD Raw Image Mode via TCC-safe FIFO pipe
     let rawPayload = workDir.appendingPathComponent("raw_test.img")
     let pattern = Data((0..<1_048_576).map { UInt8($0 % 251) })
     try pattern.write(to: rawPayload)
+
+    let fifoPath = workDir.appendingPathComponent("raw_test.fifo").path
+    try assertEqual(mkfifo(fifoPath, 0o666), 0, "mkfifo failed")
+    DispatchQueue.global(qos: .userInitiated).async {
+        let fd = open(fifoPath, O_WRONLY)
+        if fd >= 0 {
+            pattern.withUnsafeBytes { rawBuf in
+                var off = 0
+                while off < pattern.count {
+                    let n = write(fd, rawBuf.baseAddress!.advanced(by: off), pattern.count - off)
+                    if n <= 0 { break }
+                    off += n
+                }
+            }
+            close(fd)
+        }
+    }
 
     try FlashEngine(emit: { _ in }, isCancelled: { false }).execute(config: FlashJobConfig(
         targetDeviceIdentifier: diskId,
         bootMode: .isoOrImage,
         writeMode: .ddRawImage,
         isoPath: rawPayload.path,
+        rawFifoPath: fifoPath,
+        rawInputSizeBytes: Int64(pattern.count),
         isoKind: .rawDiskImage,
         partitionScheme: .gpt,
         fileSystem: .fat32,
@@ -337,8 +361,8 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     let verifyFH = try FileHandle(forReadingFrom: URL(fileURLWithPath: devNode))
     let readBack = verifyFH.readData(ofLength: pattern.count)
     try verifyFH.close()
-    try assertEqual(readBack, pattern, "DD raw write mismatch")
-    print("         [sub-check] DD Raw Image byte-for-byte write OK")
+    try assertEqual(readBack, pattern, "DD raw write via FIFO mismatch")
+    print("         [sub-check] DD Raw Image via TCC-safe FIFO pipe byte-for-byte OK")
 }
 
 print("=== Results: \(passed) passed, \(failed) failed ===")
