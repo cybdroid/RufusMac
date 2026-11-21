@@ -1,0 +1,27 @@
+# Swift Package Manager & Xcode
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Build & Vendored Helper Artifacts
+build/
+vendor_build/
+*.app
+*.dmg
+*.iso
+*.img
+*.icns
+*.iconset
+
+# macOS Metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Secrets / Tokens
+*token*
+*.env
+.env

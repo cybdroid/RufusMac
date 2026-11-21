@@ -1,0 +1,12 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+
+RufusMac - Bootable Windows & Linux USB Creator for Intel macOS
+
+This project is free software licensed under the GNU General Public License,
+version 3 or (at your option) any later version (GPL-3.0-or-later).
+
+Full license text: https://www.gnu.org/licenses/gpl-3.0.txt
+
+Bundled helper tools built from upstream source via scripts/build-helpers.sh:
+- wimlib (https://wimlib.net) — GPL-3.0-or-later
+- ms-sys (https://ms-sys.sourceforge.net) — GPL-2.0-or-later
