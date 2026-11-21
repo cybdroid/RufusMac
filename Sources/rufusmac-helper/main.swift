@@ -22,7 +22,7 @@ private final class EventWriter {
         lock.lock()
         defer { lock.unlock() }
         guard var data = try? encoder.encode(event) else { return }
-        data.append(0x0A) // newline
+        data.append(0x0A)
         if let fh = fileHandle {
             fh.write(data)
             try? fh.synchronize()
@@ -41,6 +41,7 @@ func runHelper() -> Int32 {
     var jobPath: String?
     var eventsPath: String?
     var cancelFlagPath: String?
+    var exitFilePath: String?
 
     var i = 1
     while i < args.count {
@@ -51,8 +52,10 @@ func runHelper() -> Int32 {
             if i + 1 < args.count { eventsPath = args[i + 1]; i += 1 }
         case "--cancel-flag":
             if i + 1 < args.count { cancelFlagPath = args[i + 1]; i += 1 }
+        case "--exit-file":
+            if i + 1 < args.count { exitFilePath = args[i + 1]; i += 1 }
         case "--version":
-            print("rufusmac-helper 1.0.0")
+            print("rufusmac-helper 1.2.0")
             return 0
         default:
             break
@@ -60,9 +63,16 @@ func runHelper() -> Int32 {
         i += 1
     }
 
+    func finish(_ code: Int32) -> Int32 {
+        if let ef = exitFilePath {
+            try? "\(code)".write(toFile: ef, atomically: true, encoding: .utf8)
+        }
+        return code
+    }
+
     guard let jobFile = jobPath else {
-        fputs("Usage: rufusmac-helper --job <job.json> [--events <events.jsonl>] [--cancel-flag <cancel.flag>]\n", stderr)
-        return 64
+        fputs("Usage: rufusmac-helper --job <job.json> [--events <events.jsonl>] [--cancel-flag <cancel.flag>] [--exit-file <exit.txt>]\n", stderr)
+        return finish(64)
     }
 
     let writer = EventWriter(path: eventsPath)
@@ -82,15 +92,26 @@ func runHelper() -> Int32 {
         )
 
         try engine.execute(config: config)
-        return 0
+        return finish(0)
     } catch FlashEngineError.cancelled {
         writer.emit(FlashProgressEvent(kind: .cancelled, stage: "Abgebrochen", message: "Vorgang wurde abgebrochen."))
-        return 2
+        return finish(2)
+    } catch let err as FlashEngineError {
+        let msg = err.localizedDescription
+        let code: Int32
+        if case .fullDiskAccessRequired = err {
+            code = 13 // EACCES sentinel
+        } else {
+            code = 1
+        }
+        writer.emit(FlashProgressEvent(kind: .failed, stage: "Fehler", message: msg))
+        fputs("\(msg)\n", stderr)
+        return finish(code)
     } catch {
         let msg = error.localizedDescription
         writer.emit(FlashProgressEvent(kind: .failed, stage: "Fehler", message: msg))
         fputs("\(msg)\n", stderr)
-        return 1
+        return finish(1)
     }
 }
 

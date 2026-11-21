@@ -349,6 +349,8 @@ public struct FlashJobConfig: Codable, Sendable {
     public let windowsOptions: WindowsCustomizationOptions
     public let helpersDirectory: String?
     public let allowDiskImageTarget: Bool       // Strictly false in UI; true only for automated virtual disk tests
+    public let skipMBRBootSectorWrite: Bool     // When true, Phase 1 runs unprivileged; Phase 2 helper stamps MBR/VBR
+    public let onlyWriteMBRBootSectors: Bool    // When true, privileged helper ONLY stamps NT6 MBR/VBR + Active 0x80
 
     public init(
         targetDeviceIdentifier: String,
@@ -368,7 +370,9 @@ public struct FlashJobConfig: Codable, Sendable {
         autoEjectAfterFlash: Bool,
         windowsOptions: WindowsCustomizationOptions,
         helpersDirectory: String? = nil,
-        allowDiskImageTarget: Bool = false
+        allowDiskImageTarget: Bool = false,
+        skipMBRBootSectorWrite: Bool = false,
+        onlyWriteMBRBootSectors: Bool = false
     ) {
         self.targetDeviceIdentifier = targetDeviceIdentifier
         self.bootMode = bootMode
@@ -388,6 +392,8 @@ public struct FlashJobConfig: Codable, Sendable {
         self.windowsOptions = windowsOptions
         self.helpersDirectory = helpersDirectory
         self.allowDiskImageTarget = allowDiskImageTarget
+        self.skipMBRBootSectorWrite = skipMBRBootSectorWrite
+        self.onlyWriteMBRBootSectors = onlyWriteMBRBootSectors
     }
 }
 
@@ -441,7 +447,8 @@ public enum VolumeLabelSanitizer {
             let filteredScalars = upper.unicodeScalars.filter { allowed.contains($0) }
             let cleaned = String(String.UnicodeScalarView(filteredScalars))
                 .trimmingCharacters(in: .whitespaces)
-            let truncated = String(cleaned.prefix(11)).trimmingCharacters(in: .whitespaces)
+            let truncated = String(cleaned.prefix(11))
+                .trimmingCharacters(in: CharacterSet(charactersIn: " _-"))
             return truncated.isEmpty ? "RUFUSMAC" : truncated
         case .dualFat32ExFAT, .exfat:
             let forbidden = CharacterSet(charactersIn: "/\\:*?\"<>|")

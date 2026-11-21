@@ -1,9 +1,11 @@
 import Foundation
+import Security
 import Darwin
 
 public enum PrivilegeRunnerError: LocalizedError {
     case helperBinaryNotFound
     case authorizationCancelled
+    case authorizationFailed(OSStatus)
     case executionFailed(String)
 
     public var errorDescription: String? {
@@ -12,29 +14,35 @@ public enum PrivilegeRunnerError: LocalizedError {
             return "Interner Helper 'rufusmac-helper' wurde im App-Bundle nicht gefunden."
         case .authorizationCancelled:
             return "Administrator-Authentifizierung wurde abgebrochen."
+        case .authorizationFailed(let status):
+            return "Administrator-Authentifizierung fehlgeschlagen (Status \(status))."
         case .executionFailed(let msg):
             return msg
         }
     }
 }
 
-/// Runs `rufusmac-helper` with macOS Administrator privileges while:
-/// 1. Pre-mounting ISOs in the non-root GUI user's session (avoiding macOS TCC denials on ~/Downloads & ~/Desktop).
-/// 2. Streaming raw DD images over a private `/tmp` FIFO from the GUI user to the root helper (zero TCC errors, zero extra disk space).
-/// 3. Streaming live JSONL progress events and supporting instant cancellation without a second password prompt.
+/// Orchestrates FlashEngine jobs cleanly on macOS:
+/// - Standard GPT/UEFI Windows & Linux ISO flashing (FAT32 Auto-WIM-Split, Dual-Partition ExFAT) and Non-Bootable formatting
+///   run 100% natively IN-PROCESS via Apple's `diskutil` (`diskmanagementd`) — ZERO password prompt, ZERO raw `/dev/rdiskN` open, ZERO TCC failures!
+/// - MBR Legacy BIOS boot-sector stamping (`ms-sys`) runs as a quick Phase 2 via Security.framework's `AuthorizationExecuteWithPrivileges`
+///   after Phase 1 finishes copying & splitting files unprivileged!
+/// - DD Raw Image mode & custom cluster size invoke `rufusmac-helper` directly via `AuthorizationExecuteWithPrivileges` (NOT `osascript`)
+///   with `/private/tmp` FIFO streaming so `~/Downloads` is never touched by root.
 public final class PrivilegeRunner {
     private var workDir: URL?
     private var cancelFlagURL: URL?
     private var eventsURL: URL?
     private var rawFifoURL: URL?
     private var preMountedISO: MountedImageInfo?
-    private var process: Process?
     private var pollTimer: DispatchSourceTimer?
     private var readOffset: UInt64 = 0
     private var partialLineBuffer = Data()
     private var lastHelperFailureMessage: String?
     private var sleepActivity: NSObjectProtocol?
     private var isStoppingFifo = false
+    private var inProcessCancelled = false
+    private let cancelLock = NSLock()
     private let stateQueue = DispatchQueue(label: "dev.rufusmac.privilegerunner")
 
     public init() {}
@@ -59,51 +67,142 @@ public final class PrivilegeRunner {
         return nil
     }
 
+    private func isJobCancelled() -> Bool {
+        cancelLock.lock()
+        let c = inProcessCancelled
+        cancelLock.unlock()
+        return c
+    }
+
     public func start(
         config: FlashJobConfig,
         onEvent: @escaping (FlashProgressEvent) -> Void,
         onFinish: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard let helperPath = Self.locateHelperBinary() else {
-            onFinish(.failure(PrivilegeRunnerError.helperBinaryNotFound))
-            return
-        }
+        cancelLock.lock()
+        inProcessCancelled = false
+        cancelLock.unlock()
+        isStoppingFifo = false
+        lastHelperFailureMessage = nil
 
-        // Prevent macOS App Nap / idle sleep during long USB writes
         sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled],
             reason: "RufusMac is writing a bootable USB drive"
         )
 
-        // Do ISO mounting / job setup on background queue so UI never stalls
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            self.runPipeline(helperPath: helperPath, config: config, onEvent: onEvent, onFinish: onFinish)
+            self.runPipeline(config: config, onEvent: onEvent, onFinish: onFinish)
         }
     }
 
     private func runPipeline(
-        helperPath: String,
         config: FlashJobConfig,
         onEvent: @escaping (FlashProgressEvent) -> Void,
         onFinish: @escaping (Result<Void, Error>) -> Void
     ) {
+        defer { cleanup() }
+
+        let resolvedHelpersDir = config.helpersDirectory ?? Self.locateHelpersDirectory()
+
+        // PATH A: Runs completely IN-PROCESS without root/osascript/Full Disk Access!
+        // Covers: GPT (UEFI) FAT32 Auto-WIM-Split, GPT Dual-Partition ExFAT, GPT ExFAT, Non-Bootable Format!
+        if !FlashEngine.requiresRootForWholeJob(config) {
+            let needsMBRPhase2 = FlashEngine.needsMBRBootSectorPhase2(config)
+
+            let phase1Config = FlashJobConfig(
+                targetDeviceIdentifier: config.targetDeviceIdentifier,
+                bootMode: config.bootMode,
+                writeMode: config.writeMode,
+                isoPath: config.isoPath,
+                preMountedISOPath: config.preMountedISOPath,
+                rawFifoPath: nil,
+                rawInputSizeBytes: nil,
+                isoKind: config.isoKind,
+                partitionScheme: config.partitionScheme,
+                fileSystem: config.fileSystem,
+                volumeLabel: config.volumeLabel,
+                clusterSize: config.clusterSize,
+                quickFormat: config.quickFormat,
+                wipePartitionTable: config.wipePartitionTable,
+                autoEjectAfterFlash: needsMBRPhase2 ? false : config.autoEjectAfterFlash,
+                windowsOptions: config.windowsOptions,
+                helpersDirectory: resolvedHelpersDir,
+                allowDiskImageTarget: config.allowDiskImageTarget,
+                skipMBRBootSectorWrite: needsMBRPhase2,
+                onlyWriteMBRBootSectors: false
+            )
+
+            do {
+                let engine = FlashEngine(
+                    emit: onEvent,
+                    isCancelled: { [weak self] in self?.isJobCancelled() ?? false }
+                )
+                try engine.execute(config: phase1Config)
+
+                // If no MBR Phase 2 needed, we are 100% done!
+                if !needsMBRPhase2 {
+                    onFinish(.success(()))
+                    return
+                }
+
+                // PATH A2: MBR Phase 2 — quick privileged NT6 MBR/VBR boot-sector stamp via Security.framework
+                if isJobCancelled() {
+                    onFinish(.failure(FlashEngineError.cancelled))
+                    return
+                }
+
+                guard let helperPath = Self.locateHelperBinary() else {
+                    onFinish(.failure(PrivilegeRunnerError.helperBinaryNotFound))
+                    return
+                }
+
+                onEvent(FlashProgressEvent(
+                    kind: .stage,
+                    stage: "Administrator-Freigabe für MBR-Bootsektor…",
+                    fraction: 0.92,
+                    message: "Dateien vollständig geschrieben. Bestätige für Legacy-BIOS MBR/VBR-Bootsektor…"
+                ))
+
+                let phase2Config = FlashJobConfig(
+                    targetDeviceIdentifier: config.targetDeviceIdentifier,
+                    bootMode: config.bootMode,
+                    writeMode: config.writeMode,
+                    isoPath: nil,
+                    isoKind: config.isoKind,
+                    partitionScheme: .mbr,
+                    fileSystem: config.fileSystem,
+                    volumeLabel: config.volumeLabel,
+                    clusterSize: .automatic,
+                    quickFormat: true,
+                    wipePartitionTable: false,
+                    autoEjectAfterFlash: config.autoEjectAfterFlash,
+                    windowsOptions: WindowsCustomizationOptions(),
+                    helpersDirectory: resolvedHelpersDir,
+                    allowDiskImageTarget: config.allowDiskImageTarget,
+                    skipMBRBootSectorWrite: false,
+                    onlyWriteMBRBootSectors: true
+                )
+
+                try runPrivilegedHelper(helperPath: helperPath, config: phase2Config, onEvent: onEvent)
+                onFinish(.success(()))
+            } catch {
+                onFinish(.failure(error))
+            }
+            return
+        }
+
+        // PATH B: Whole job requires privileged helper (DD Raw Image Mode or Custom Cluster Size)
+        guard let helperPath = Self.locateHelperBinary() else {
+            onFinish(.failure(PrivilegeRunnerError.helperBinaryNotFound))
+            return
+        }
+
         do {
             let dir = URL(fileURLWithPath: "/private/tmp")
                 .appendingPathComponent("rufusmac-job-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-
-            let jobURL = dir.appendingPathComponent("job.json")
-            let eventsFileURL = dir.appendingPathComponent("events.jsonl")
-            let cancelURL = dir.appendingPathComponent("cancel.flag")
-
             self.workDir = dir
-            self.eventsURL = eventsFileURL
-            self.cancelFlagURL = cancelURL
-            self.readOffset = 0
-            self.partialLineBuffer = Data()
-            self.lastHelperFailureMessage = nil
-            self.isStoppingFifo = false
 
             var preMountedPath: String? = nil
             var fifoPath: String? = nil
@@ -111,14 +210,11 @@ public final class PrivilegeRunner {
 
             if config.bootMode == .isoOrImage, let isoPath = config.isoPath, !isoPath.isEmpty {
                 if config.writeMode == .isoFileCopy {
-                    // Mount ISO in the GUI user's process & session (100% TCC-safe for ~/Downloads, ~/Desktop, etc.!)
                     onEvent(FlashProgressEvent(kind: .stage, stage: "Hänge ISO-Abbild ein…", fraction: 0.02, message: "Hänge ISO-Abbild im Benutzerkontext ein…"))
                     let mounted = try ISOInspector.attachReadOnly(isoPath: isoPath, preferReuseExisting: true)
                     self.preMountedISO = mounted
                     preMountedPath = mounted.mountPoint
-                    onEvent(FlashProgressEvent(kind: .log, message: "ISO bereitgestellt unter: \(mounted.mountPoint) (Volume: \(mounted.volumeName))"))
                 } else {
-                    // DD Raw Image Mode: stream via /tmp FIFO from GUI user -> root helper (100% TCC-safe!)
                     let attrs = try FileManager.default.attributesOfItem(atPath: isoPath)
                     rawSize = (attrs[.size] as? Int64) ?? 0
                     let fifoURL = dir.appendingPathComponent("raw.fifo")
@@ -128,13 +224,11 @@ public final class PrivilegeRunner {
                     chmod(fifoURL.path, 0o666)
                     self.rawFifoURL = fifoURL
                     fifoPath = fifoURL.path
-
                     startRawFifoFeeder(sourcePath: isoPath, fifoPath: fifoURL.path)
-                    onEvent(FlashProgressEvent(kind: .log, message: "DD-Datenstrom bereit (\(ByteCountFormatter.string(fromByteCount: rawSize ?? 0, countStyle: .decimal)))."))
                 }
             }
 
-            let enrichedConfig = FlashJobConfig(
+            let enriched = FlashJobConfig(
                 targetDeviceIdentifier: config.targetDeviceIdentifier,
                 bootMode: config.bootMode,
                 writeMode: config.writeMode,
@@ -151,77 +245,175 @@ public final class PrivilegeRunner {
                 wipePartitionTable: config.wipePartitionTable,
                 autoEjectAfterFlash: config.autoEjectAfterFlash,
                 windowsOptions: config.windowsOptions,
-                helpersDirectory: config.helpersDirectory ?? (helperPath as NSString).deletingLastPathComponent,
+                helpersDirectory: resolvedHelpersDir,
                 allowDiskImageTarget: config.allowDiskImageTarget
             )
 
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted]
-            let jsonData = try encoder.encode(enrichedConfig)
-            try jsonData.write(to: jobURL)
-
-            FileManager.default.createFile(atPath: eventsFileURL.path, contents: Data(), attributes: [.posixPermissions: 0o666])
-            chmod(eventsFileURL.path, 0o666)
-
-            onEvent(FlashProgressEvent(kind: .stage, stage: "Warte auf Administrator-Freigabe…", fraction: 0.03, message: "Bitte Administrator-Passwort oder Touch ID bestätigen…"))
-
-            startPollingEvents(onEvent: onEvent)
-
-            let shellCmd = [
-                shellQuote(helperPath),
-                "--job", shellQuote(jobURL.path),
-                "--events", shellQuote(eventsFileURL.path),
-                "--cancel-flag", shellQuote(cancelURL.path)
-            ].joined(separator: " ")
-
-            let appleScript = "do shell script \"\(appleScriptEscape(shellCmd))\" with administrator privileges"
-
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            proc.arguments = ["-e", appleScript]
-            let errPipe = Pipe()
-            let outPipe = Pipe()
-            proc.standardError = errPipe
-            proc.standardOutput = outPipe
-            self.process = proc
-
-            try proc.run()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-
-            let wasCancelled = FileManager.default.fileExists(atPath: cancelURL.path)
-
-            self.stateQueue.sync {
-                self.stopPollingEvents()
-                self.drainNewEvents(onEvent: onEvent)
-            }
-
-            let status = proc.terminationStatus
-            let rawErr = (String(data: errData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let structuredHelperErr = self.lastHelperFailureMessage
-
-            self.cleanup()
-
-            if status == 0 {
-                onFinish(.success(()))
-            } else if rawErr.contains("-128")
-                        || rawErr.localizedCaseInsensitiveContains("User canceled")
-                        || rawErr.localizedCaseInsensitiveContains("Benutzer hat abgebrochen") {
-                onFinish(.failure(PrivilegeRunnerError.authorizationCancelled))
-            } else if wasCancelled {
-                onFinish(.failure(FlashEngineError.cancelled))
-            } else {
-                let cleanMsg = structuredHelperErr ?? Self.cleanAppleScriptError(rawErr, exitCode: status)
-                onFinish(.failure(PrivilegeRunnerError.executionFailed(cleanMsg)))
-            }
+            try runPrivilegedHelper(helperPath: helperPath, config: enriched, existingWorkDir: dir, onEvent: onEvent)
+            onFinish(.success(()))
         } catch {
-            self.stateQueue.sync { self.stopPollingEvents() }
-            self.cleanup()
             onFinish(.failure(error))
         }
     }
 
+    // MARK: - Native Security.framework AuthorizationExecuteWithPrivileges (NO osascript!)
+
+    private typealias AuthExecFn = @convention(c) (
+        AuthorizationRef,
+        UnsafePointer<CChar>,
+        AuthorizationFlags,
+        UnsafePointer<UnsafeMutablePointer<CChar>?>,
+        UnsafeMutablePointer<UnsafeMutablePointer<FILE>?>?
+    ) -> OSStatus
+
+    private func runPrivilegedHelper(
+        helperPath: String,
+        config: FlashJobConfig,
+        existingWorkDir: URL? = nil,
+        onEvent: @escaping (FlashProgressEvent) -> Void
+    ) throws {
+        let dir: URL
+        if let existing = existingWorkDir {
+            dir = existing
+        } else {
+            dir = URL(fileURLWithPath: "/private/tmp")
+                .appendingPathComponent("rufusmac-job-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+            self.workDir = dir
+        }
+
+        let jobURL = dir.appendingPathComponent("job.json")
+        let eventsFileURL = dir.appendingPathComponent("events.jsonl")
+        let cancelURL = dir.appendingPathComponent("cancel.flag")
+        let exitFileURL = dir.appendingPathComponent("exit.txt")
+
+        self.eventsURL = eventsFileURL
+        self.cancelFlagURL = cancelURL
+        self.readOffset = 0
+        self.partialLineBuffer = Data()
+        self.lastHelperFailureMessage = nil
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        try encoder.encode(config).write(to: jobURL)
+
+        FileManager.default.createFile(atPath: eventsFileURL.path, contents: Data(), attributes: [.posixPermissions: 0o666])
+        chmod(eventsFileURL.path, 0o666)
+        FileManager.default.createFile(atPath: exitFileURL.path, contents: Data(), attributes: [.posixPermissions: 0o666])
+        chmod(exitFileURL.path, 0o666)
+
+        onEvent(FlashProgressEvent(
+            kind: .stage,
+            stage: "Warte auf Administrator-Freigabe…",
+            fraction: config.onlyWriteMBRBootSectors ? 0.92 : 0.03,
+            message: "Bitte Administrator-Passwort oder Touch ID für RufusMac bestätigen…"
+        ))
+
+        // Create AuthorizationRef
+        var authRef: AuthorizationRef?
+        let createStatus = AuthorizationCreate(nil, nil, [], &authRef)
+        guard createStatus == errAuthorizationSuccess, let auth = authRef else {
+            throw PrivilegeRunnerError.authorizationFailed(createStatus)
+        }
+        defer { AuthorizationFree(auth, []) }
+
+        // Request right to execute privileged helper
+        let rightName = kAuthorizationRightExecute
+        let copyStatus: OSStatus = rightName.withCString { cName in
+            var item = AuthorizationItem(name: cName, valueLength: 0, value: nil, flags: 0)
+            return withUnsafeMutablePointer(to: &item) { itemPtr in
+                var rights = AuthorizationRights(count: 1, items: itemPtr)
+                let flags: AuthorizationFlags = [.interactionAllowed, .extendRights, .preAuthorize]
+                return AuthorizationCopyRights(auth, &rights, nil, flags, nil)
+            }
+        }
+
+        if copyStatus == errAuthorizationCanceled {
+            throw PrivilegeRunnerError.authorizationCancelled
+        }
+        guard copyStatus == errAuthorizationSuccess else {
+            throw PrivilegeRunnerError.authorizationFailed(copyStatus)
+        }
+
+        // Load AuthorizationExecuteWithPrivileges dynamically (clean, zero Swift deprecation errors)
+        guard let secHandle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+              let sym = dlsym(secHandle, "AuthorizationExecuteWithPrivileges") else {
+            throw PrivilegeRunnerError.executionFailed("Security.framework AuthorizationExecuteWithPrivileges nicht verfügbar.")
+        }
+        let execFn = unsafeBitCast(sym, to: AuthExecFn.self)
+
+        startPollingEvents(onEvent: onEvent)
+
+        let cliArgs = [
+            "--job", jobURL.path,
+            "--events", eventsFileURL.path,
+            "--cancel-flag", cancelURL.path,
+            "--exit-file", exitFileURL.path
+        ]
+        var cArgs: [UnsafeMutablePointer<CChar>?] = cliArgs.map { strdup($0) }
+        cArgs.append(nil)
+        defer {
+            for ptr in cArgs { if let p = ptr { free(p) } }
+        }
+
+        var commPipe: UnsafeMutablePointer<FILE>? = nil
+        let execStatus = helperPath.withCString { cPath in
+            cArgs.withUnsafeBufferPointer { buf in
+                execFn(auth, cPath, [], buf.baseAddress!, &commPipe)
+            }
+        }
+
+        if execStatus == errAuthorizationCanceled {
+            stateQueue.sync { stopPollingEvents() }
+            throw PrivilegeRunnerError.authorizationCancelled
+        }
+        guard execStatus == errAuthorizationSuccess else {
+            stateQueue.sync { stopPollingEvents() }
+            throw PrivilegeRunnerError.authorizationFailed(execStatus)
+        }
+
+        // Wait until helper closes stdout / exits by draining commPipe cleanly
+        if let pipe = commPipe {
+            var discard = [UInt8](repeating: 0, count: 4096)
+            while fread(&discard, 1, discard.count, pipe) > 0 {
+                // Keep draining until helper exits
+            }
+            fclose(pipe)
+        }
+
+        // Give helper a tiny moment to flush final exit code & events if pipe closed early
+        for _ in 0..<20 {
+            if let txt = try? String(contentsOf: exitFileURL, encoding: .utf8),
+               !txt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        stateQueue.sync {
+            stopPollingEvents()
+            drainNewEvents(onEvent: onEvent)
+        }
+
+        let exitStr = (try? String(contentsOf: exitFileURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let exitCode = Int32(exitStr) ?? (lastHelperFailureMessage == nil ? 0 : 1)
+
+        if exitCode == 0 {
+            return
+        } else if exitCode == 2 || isJobCancelled() || FileManager.default.fileExists(atPath: cancelURL.path) {
+            throw FlashEngineError.cancelled
+        } else if exitCode == 13 {
+            throw FlashEngineError.fullDiskAccessRequired(lastHelperFailureMessage ?? "Operation not permitted")
+        } else {
+            throw PrivilegeRunnerError.executionFailed(lastHelperFailureMessage ?? "Helper beendet mit Fehlercode \(exitCode).")
+        }
+    }
+
     public func cancel() {
+        cancelLock.lock()
+        inProcessCancelled = true
+        cancelLock.unlock()
+
         isStoppingFifo = true
         if let cancelURL = cancelFlagURL {
             FileManager.default.createFile(atPath: cancelURL.path, contents: Data("1".utf8))
@@ -231,9 +423,7 @@ public final class PrivilegeRunner {
 
     private func startRawFifoFeeder(sourcePath: String, fifoPath: String) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Ignore SIGPIPE on broken pipe when helper finishes or cancels
             signal(SIGPIPE, SIG_IGN)
-
             let inFD = open(sourcePath, O_RDONLY)
             guard inFD >= 0 else { return }
             defer { close(inFD) }
@@ -262,11 +452,8 @@ public final class PrivilegeRunner {
 
     private func unblockFifoIfWaiting() {
         guard let fifo = rawFifoURL?.path else { return }
-        // Opening the read end non-blocking briefly releases a writer blocked in open(O_WRONLY)
         let fd = open(fifo, O_RDONLY | O_NONBLOCK)
-        if fd >= 0 {
-            close(fd)
-        }
+        if fd >= 0 { close(fd) }
     }
 
     private func startPollingEvents(onEvent: @escaping (FlashProgressEvent) -> Void) {
@@ -307,14 +494,14 @@ public final class PrivilegeRunner {
                     onEvent(event)
                 }
             }
-        } catch {
-            // Ignore transient read errors
-        }
+        } catch {}
     }
 
     private func cleanup() {
         isStoppingFifo = true
         unblockFifoIfWaiting()
+
+        stateQueue.sync { stopPollingEvents() }
 
         if let mounted = preMountedISO {
             ISOInspector.detach(mounted)
@@ -328,38 +515,10 @@ public final class PrivilegeRunner {
         eventsURL = nil
         cancelFlagURL = nil
         rawFifoURL = nil
-        process = nil
 
         if let activity = sleepActivity {
             ProcessInfo.processInfo.endActivity(activity)
             sleepActivity = nil
         }
-    }
-
-    private static func cleanAppleScriptError(_ raw: String, exitCode: Int32) -> String {
-        guard !raw.isEmpty else {
-            return "Vorgang mit Fehlercode \(exitCode) beendet."
-        }
-        // Strip ugly "0:343: execution error: " prefix and trailing " (1)"
-        var s = raw.replacingOccurrences(
-            of: #"^\d+:\d+:\s*execution error:\s*"#,
-            with: "",
-            options: .regularExpression
-        )
-        s = s.replacingOccurrences(
-            of: #"\s*\(\d+\)\s*$"#,
-            with: "",
-            options: .regularExpression
-        )
-        return s.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    private func appleScriptEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }

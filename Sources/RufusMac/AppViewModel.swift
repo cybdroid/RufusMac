@@ -68,6 +68,7 @@ final class AppViewModel: ObservableObject {
 
     // Execution State
     @Published var runState: FlashRunState = .idle
+    @Published var needsFullDiskAccessPrompt: Bool = false
     @Published var progressFraction: Double = 0.0
     @Published var currentStage: String = ""
     @Published var currentDetail: String = ""
@@ -345,8 +346,9 @@ final class AppViewModel: ObservableObject {
         guard let drive = selectedDrive else { return }
 
         runState = .running
+        needsFullDiskAccessPrompt = false
         progressFraction = 0.01
-        currentStage = t("Warte auf Administrator-Freigabe…", "Waiting for Administrator authorization…")
+        currentStage = t("Initialisiere Flash-Vorgang…", "Initializing flash…")
         currentDetail = ""
         speedMBps = nil
         elapsedSeconds = 0
@@ -443,6 +445,11 @@ final class AppViewModel: ObservableObject {
             } else if let feErr = error as? FlashEngineError, case .cancelled = feErr {
                 runState = .cancelled
                 currentStage = t("Abgebrochen", "Cancelled")
+            } else if let feErr = error as? FlashEngineError, case .fullDiskAccessRequired = feErr {
+                needsFullDiskAccessPrompt = true
+                runState = .failed(feErr.localizedDescription)
+                currentStage = t("Festplattenvollzugriff benötigt", "Full Disk Access required")
+                appendLog(.error, feErr.localizedDescription)
             } else {
                 runState = .failed(error.localizedDescription)
                 currentStage = t("Fehlgeschlagen", "Failed")
@@ -450,6 +457,12 @@ final class AppViewModel: ObservableObject {
             }
         }
         refreshDrives()
+    }
+
+    func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Timer & Logs

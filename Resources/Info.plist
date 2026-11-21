@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
@@ -30,6 +30,14 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>RufusMac benötigt Zugriff auf Wechseldatenträger, um Windows- und Linux-Installationsdateien auf deinen USB-Stick zu schreiben.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>RufusMac benötigt Zugriff auf deinen Downloads-Ordner, um ausgewählte ISO- und Disk-Image-Dateien zu lesen.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>RufusMac benötigt Zugriff auf deinen Schreibtisch, um ausgewählte ISO- und Disk-Image-Dateien zu lesen.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>RufusMac benötigt Zugriff auf deinen Dokumente-Ordner, um ausgewählte ISO- und Disk-Image-Dateien zu lesen.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

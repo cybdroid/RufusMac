@@ -8,6 +8,7 @@ public enum FlashEngineError: LocalizedError {
     case commandFailed(command: String, details: String)
     case fileTooLargeForFAT32(String)
     case insufficientDiskSpace(requiredMB: Int64, availableMB: Int64)
+    case fullDiskAccessRequired(String)
     case ioError(String)
     case mountPointNotFound(String)
 
@@ -25,6 +26,8 @@ public enum FlashEngineError: LocalizedError {
             return "Datei '\(path)' überschreitet das 4-GB-Limit von FAT32. Verwende 'ExFAT + FAT32 Boot (Dual-Partition)' oder den DD-Image-Modus."
         case .insufficientDiskSpace(let req, let avail):
             return "Nicht genügend Speicherplatz auf dem Ziel-Laufwerk: benötigt ~\(req) MB, verfügbar \(avail) MB."
+        case .fullDiskAccessRequired(let reason):
+            return "macOS blockiert den Roh-Zugriff auf das Laufwerk (\(reason)). Bitte erlaube 'RufusMac' unter Systemeinstellungen → Datenschutz & Sicherheit → Festplattenvollzugriff (oder nutze GPT / UEFI, das ohne Festplattenvollzugriff funktioniert)."
         case .ioError(let msg):
             return "E/A-Fehler: \(msg)"
         case .mountPointNotFound(let dev):
@@ -43,6 +46,26 @@ public final class FlashEngine {
     public init(emit: @escaping EventHandler, isCancelled: @escaping CancelChecker) {
         self.emit = emit
         self.isCancelled = isCancelled
+    }
+
+    /// Returns true ONLY if the job must open raw `/dev/diskN` or `/dev/rdiskN` block devices directly
+    /// (DD raw image write, custom cluster size via newfs_*, or Legacy BIOS MBR boot sectors via ms-sys).
+    /// Standard GPT (UEFI) FAT32 Auto-WIM-Split, Dual-Partition ExFAT, and Format-Only run 100% via Apple's
+    /// `diskutil` (`diskmanagementd`) WITHOUT root privileges or Full Disk Access!
+    public static func requiresRootForWholeJob(_ config: FlashJobConfig) -> Bool {
+        if config.onlyWriteMBRBootSectors { return true }
+        if config.bootMode == .isoOrImage && config.writeMode == .ddRawImage { return true }
+        if config.clusterSize != .automatic && config.fileSystem != .apfs && config.fileSystem != .hfsPlus { return true }
+        return false
+    }
+
+    /// Returns true if a bootable MBR job needs the quick Phase-2 privileged MBR/VBR boot-sector stamp after file copy.
+    public static func needsMBRBootSectorPhase2(_ config: FlashJobConfig) -> Bool {
+        config.bootMode == .isoOrImage
+            && config.writeMode == .isoFileCopy
+            && config.partitionScheme == .mbr
+            && !config.skipMBRBootSectorWrite
+            && !config.onlyWriteMBRBootSectors
     }
 
     private func log(_ msg: String) {
@@ -76,10 +99,35 @@ public final class FlashEngine {
         let blockDev = "/dev/\(diskId)"
         let rawDev = "/dev/r\(diskId)"
 
-        stage("Sicherheitsprüfung…", fraction: 0.01)
+        stage("Sicherheitsprüfung…", fraction: config.onlyWriteMBRBootSectors ? 0.92 : 0.01)
         try DiskDiscovery.validateSafeTarget(deviceIdentifier: diskId, allowDiskImage: config.allowDiskImageTarget)
-        log("Ziel-Laufwerk verifiziert: \(blockDev) (\(config.partitionScheme.rawValue) / \(config.fileSystem.rawValue))")
 
+        // Phase-2 only mode: stamp Windows NT6 MBR + VBR + Active 0x80 on an already-flashed MBR USB drive
+        if config.onlyWriteMBRBootSectors {
+            let slice1 = "\(blockDev)s1"
+            let bootFS: FileSystemType = (config.fileSystem == .exfat) ? .exfat : .fat32
+            stage("Schreibe Windows NT6 MBR & VBR Bootsektor…", fraction: 0.93)
+            try writeLegacyBIOSBootSectors(
+                blockDev: blockDev,
+                bootSlice: slice1,
+                bootFS: bootFS,
+                helpersDir: config.helpersDirectory
+            )
+            Darwin.sync()
+            if config.autoEjectAfterFlash {
+                stage("Werfe Laufwerk sicher aus…", fraction: 0.99)
+                _ = try? runCommand("/usr/sbin/diskutil", arguments: ["eject", blockDev])
+            } else {
+                try? mountSliceStandard(slice1)
+                if config.fileSystem == .dualFat32ExFAT {
+                    try? mountSliceStandard("\(blockDev)s2")
+                }
+            }
+            emit(FlashProgressEvent(kind: .completed, stage: "Fertig", fraction: 1.0, message: "Bootfähiges MBR/BIOS-Medium erfolgreich erstellt!"))
+            return
+        }
+
+        log("Ziel-Laufwerk verifiziert: \(blockDev) (\(config.partitionScheme.rawValue) / \(config.fileSystem.rawValue))")
         try checkCancelled()
 
         let diskSizeBytes = try queryDiskSizeBytes(deviceNode: blockDev)
@@ -87,72 +135,58 @@ public final class FlashEngine {
 
         switch config.bootMode {
         case .nonBootable:
-            try executeNonBootableFormat(config: config, blockDev: blockDev, rawDev: rawDev, diskSizeBytes: diskSizeBytes)
+            try executeNonBootableFormat(config: config, blockDev: blockDev)
 
         case .isoOrImage:
             if config.writeMode == .ddRawImage {
                 try executeDDRawWrite(config: config, blockDev: blockDev, rawDev: rawDev, diskSizeBytes: diskSizeBytes)
             } else {
-                try executeISOFileCopy(config: config, blockDev: blockDev, rawDev: rawDev, diskSizeBytes: diskSizeBytes)
+                try executeISOFileCopy(config: config, blockDev: blockDev, diskSizeBytes: diskSizeBytes)
             }
         }
 
-        stage("Synchronisiere Dateisystem-Cache…", fraction: 0.98)
+        stage("Synchronisiere Dateisystem-Cache…", fraction: config.skipMBRBootSectorWrite ? 0.92 : 0.98)
         Darwin.sync()
-        Thread.sleep(forTimeInterval: 0.4)
+        Thread.sleep(forTimeInterval: 0.35)
 
-        if config.autoEjectAfterFlash {
-            stage("Werfe Laufwerk sicher aus…", fraction: 0.99)
-            _ = try? runCommand("/usr/sbin/diskutil", arguments: ["eject", blockDev])
-            log("Laufwerk \(blockDev) sicher ausgeworfen.")
+        if !config.skipMBRBootSectorWrite {
+            if config.autoEjectAfterFlash {
+                stage("Werfe Laufwerk sicher aus…", fraction: 0.99)
+                _ = try? runCommand("/usr/sbin/diskutil", arguments: ["eject", blockDev])
+                log("Laufwerk \(blockDev) sicher ausgeworfen.")
+            }
+            emit(FlashProgressEvent(kind: .completed, stage: "Fertig", fraction: 1.0, message: "Bootfähiges Medium erfolgreich erstellt!"))
         }
-
-        emit(FlashProgressEvent(kind: .completed, stage: "Fertig", fraction: 1.0, message: "Bootfähiges Medium erfolgreich erstellt!"))
     }
 
-    // MARK: - Mode 1: Non-Bootable Format
+    // MARK: - Mode 1: Non-Bootable Format (100% via diskutil, no raw /dev/rdiskN open!)
 
-    private func executeNonBootableFormat(
-        config: FlashJobConfig,
-        blockDev: String,
-        rawDev: String,
-        diskSizeBytes: Int64
-    ) throws {
-        stage("Hänge Partitionen aus…", fraction: 0.10)
+    private func executeNonBootableFormat(config: FlashJobConfig, blockDev: String) throws {
+        stage("Hänge Partitionen aus…", fraction: 0.12)
         try unmountDisk(blockDev)
-
-        if config.wipePartitionTable {
-            stage("Lösche alte Partitionstabelle…", fraction: 0.20)
-            try wipeDiskHeaders(rawDev: rawDev, diskSizeBytes: diskSizeBytes)
-            Thread.sleep(forTimeInterval: 0.4)
-        }
-
         try checkCancelled()
 
         let label = VolumeLabelSanitizer.sanitize(config.volumeLabel, for: config.fileSystem)
         let schemeArg = (config.fileSystem == .apfs) ? "GPT" : config.partitionScheme.rawValue
+        let slice1 = "\(blockDev)s1"
 
         stage("Erstelle \(schemeArg)-Partitionstabelle & \(config.fileSystem.rawValue)…", fraction: 0.45)
 
         switch config.fileSystem {
         case .fat32:
-            try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, schemeArg, "MS-DOS", label, "100%"], blockDev: blockDev)
-            try unmountDisk(blockDev)
-            let slice1 = "\(blockDev)s1"
-            try formatFAT32(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
-            if !config.autoEjectAfterFlash {
-                try? mountSliceStandard(slice1)
+            try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, schemeArg, "FAT32", label, "100%"], blockDev: blockDev)
+            if config.clusterSize != .automatic {
+                try unmountDisk(blockDev)
+                try formatFAT32(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
+                if !config.autoEjectAfterFlash { try? mountSliceStandard(slice1) }
             }
 
         case .exfat, .dualFat32ExFAT:
             try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, schemeArg, "ExFAT", label, "100%"], blockDev: blockDev)
             if config.clusterSize != .automatic {
                 try unmountDisk(blockDev)
-                let slice1 = "\(blockDev)s1"
                 try formatExFAT(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
-                if !config.autoEjectAfterFlash {
-                    try? mountSliceStandard(slice1)
-                }
+                if !config.autoEjectAfterFlash { try? mountSliceStandard(slice1) }
             }
 
         case .apfs:
@@ -166,7 +200,7 @@ public final class FlashEngine {
         progress("Formatierung abgeschlossen", fraction: 0.95, message: "Formatierung erfolgreich.")
     }
 
-    // MARK: - Mode 2: DD Raw Image Write (supports direct file OR TCC-safe FIFO stream!)
+    // MARK: - Mode 2: DD Raw Image Write
 
     private func executeDDRawWrite(
         config: FlashJobConfig,
@@ -205,19 +239,24 @@ public final class FlashEngine {
         stage("Schreibe Raw-Image (DD-Modus)…", fraction: 0.05)
         log("DD-Schreibvorgang (\(ByteCountFormatter.string(fromByteCount: imageSize, countStyle: .decimal))) -> \(rawDev)")
 
+        let dstFD = open(rawDev, O_WRONLY)
+        guard dstFD >= 0 else {
+            let errCode = errno
+            let msg = String(cString: strerror(errCode))
+            if errCode == EPERM || errCode == EACCES {
+                throw FlashEngineError.fullDiskAccessRequired("DD-Schreibzugriff auf \(rawDev): \(msg)")
+            }
+            throw FlashEngineError.ioError("Kann Zielgerät \(rawDev) nicht öffnen: \(msg)")
+        }
+        defer { close(dstFD) }
+
         let srcFD = open(sourcePath, O_RDONLY)
         guard srcFD >= 0 else {
             throw FlashEngineError.ioError("Kann Bildquelle nicht öffnen: \(String(cString: strerror(errno)))")
         }
         defer { close(srcFD) }
 
-        let dstFD = open(rawDev, O_WRONLY)
-        guard dstFD >= 0 else {
-            throw FlashEngineError.ioError("Kann Zielgerät \(rawDev) nicht öffnen: \(String(cString: strerror(errno)))")
-        }
-        defer { close(dstFD) }
-
-        let bufferSize = 4 * 1024 * 1024 // 4 MB aligned block
+        let bufferSize = 4 * 1024 * 1024
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 4096)
         defer { buffer.deallocate() }
 
@@ -229,7 +268,6 @@ public final class FlashEngine {
         while !reachedEOF {
             try checkCancelled()
 
-            // Fill full 4 MB block (crucial when reading from FIFO pipe which delivers smaller chunks)
             var filled = 0
             while filled < bufferSize {
                 let n = read(srcFD, buffer.advanced(by: filled), bufferSize - filled)
@@ -246,7 +284,6 @@ public final class FlashEngine {
 
             if filled == 0 { break }
 
-            // Raw devices on macOS require 512-byte sector alignment
             var bytesToWrite = filled
             let remainder = bytesToWrite % 512
             if remainder != 0 {
@@ -290,14 +327,12 @@ public final class FlashEngine {
     private func executeISOFileCopy(
         config: FlashJobConfig,
         blockDev: String,
-        rawDev: String,
         diskSizeBytes: Int64
     ) throws {
         let isoMountPath: String
         var locallyMountedISO: MountedImageInfo? = nil
 
         if let preMounted = config.preMountedISOPath, !preMounted.isEmpty, FileManager.default.fileExists(atPath: preMounted) {
-            // Mounted by GUI user outside TCC root restrictions!
             isoMountPath = preMounted
             stage("Lese eingehängtes ISO-Abbild…", fraction: 0.03)
             log("Verwende vorab eingehängtes ISO: \(isoMountPath)")
@@ -358,22 +393,15 @@ public final class FlashEngine {
             }
         }
 
-        if config.partitionScheme == .mbr {
+        if config.partitionScheme == .mbr && !config.skipMBRBootSectorWrite {
             _ = try resolveHelper(named: "ms-sys", helpersDir: config.helpersDirectory)
         }
 
-        // Step 1: Unmount & Wipe
+        // Unmount target disk cleanly (diskutil partitionDisk destroys old MBR/GPT/UDF natively via diskmanagementd!)
         stage("Hänge Ziel-Laufwerk aus…", fraction: 0.06)
         try unmountDisk(blockDev)
-
-        if config.wipePartitionTable {
-            stage("Lösche alte Partitionstabelle & UDF-Reste…", fraction: 0.09)
-            try wipeDiskHeaders(rawDev: rawDev, diskSizeBytes: diskSizeBytes)
-            Thread.sleep(forTimeInterval: 0.5)
-        }
         try checkCancelled()
 
-        // Step 2: Partition & Copy according to FileSystemType
         if config.fileSystem == .dualFat32ExFAT {
             try executeDualPartitionCopy(
                 isoMount: isoMountPath,
@@ -406,31 +434,34 @@ public final class FlashEngine {
         let scheme = config.partitionScheme.rawValue
         let slice1 = "\(blockDev)s1"
 
-        stage("Erstelle \(scheme)-Partitionstabelle (\(config.fileSystem.rawValue))…", fraction: 0.12)
+        stage("Erstelle \(scheme)-Partitionstabelle & formatiere \(config.fileSystem.rawValue)…", fraction: 0.12)
         if config.fileSystem == .fat32 {
-            try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, scheme, "MS-DOS", label, "100%"], blockDev: blockDev)
-            try unmountDisk(blockDev)
-            stage("Formatiere FAT32 (\(label))…", fraction: 0.16)
-            try formatFAT32(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
+            // Explicit `FAT32` personality formats genuine MS-DOS FAT32 natively via diskmanagementd!
+            try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, scheme, "FAT32", label, "100%"], blockDev: blockDev)
+            if config.clusterSize != .automatic {
+                try unmountDisk(blockDev)
+                stage("Formatiere FAT32 mit Clustergröße \(config.clusterSize.rawValue) Bytes…", fraction: 0.16)
+                try formatFAT32(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
+            }
         } else {
             try partitionDiskWithRetry(arguments: ["partitionDisk", blockDev, scheme, "ExFAT", label, "100%"], blockDev: blockDev)
-            try unmountDisk(blockDev)
             if config.clusterSize != .automatic {
-                stage("Formatiere ExFAT (\(label))…", fraction: 0.16)
+                try unmountDisk(blockDev)
+                stage("Formatiere ExFAT mit Clustergröße \(config.clusterSize.rawValue) Bytes…", fraction: 0.16)
                 try formatExFAT(sliceDevice: slice1, label: label, clusterSize: config.clusterSize)
             }
         }
 
-        // Mount into private /private/tmp mountpoint (outside /Volumes TCC & Spotlight!)
-        let targetMount = try mountSlicePrivately(slice1, fsType: config.fileSystem == .exfat ? "exfat" : "msdos")
-        var privateMountActive = true
+        // Mount into private /private/tmp mountpoint (with automatic fallback to standard mountpoint)
+        let mountedTarget = try mountSliceForCopy(slice1, blockDev: blockDev, fsType: config.fileSystem == .exfat ? "exfat" : "msdos")
+        var privateMountActive = mountedTarget.isPrivateTempDir
         defer {
             if privateMountActive {
                 _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", slice1])
-                try? FileManager.default.removeItem(atPath: targetMount)
+                try? FileManager.default.removeItem(atPath: mountedTarget.path)
             }
         }
-        log("Zielpartition sicher gemountet unter: \(targetMount)")
+        log("Zielpartition bereit unter: \(mountedTarget.path)")
 
         let excludedRel = installWimEntry?.relativePath.lowercased()
         let filesToCopy = isoEntries.filter { $0.relativePath.lowercased() != excludedRel }
@@ -440,7 +471,7 @@ public final class FlashEngine {
         try copyEntries(
             filesToCopy,
             fromRoot: isoMount,
-            toRoot: targetMount,
+            toRoot: mountedTarget.path,
             progressStart: 0.18,
             progressEnd: copyEndFraction,
             stageTitle: "Kopiere Dateien…"
@@ -449,7 +480,7 @@ public final class FlashEngine {
         if let wim = installWimEntry {
             try checkCancelled()
             let srcWim = (isoMount as NSString).appendingPathComponent(wim.relativePath)
-            let dstSourcesDir = (targetMount as NSString).appendingPathComponent("sources")
+            let dstSourcesDir = (mountedTarget.path as NSString).appendingPathComponent("sources")
             try FileManager.default.createDirectory(atPath: dstSourcesDir, withIntermediateDirectories: true)
             let dstSwm = (dstSourcesDir as NSString).appendingPathComponent("install.swm")
 
@@ -466,15 +497,17 @@ public final class FlashEngine {
             log("install.wim erfolgreich in .swm-Dateien aufgeteilt.")
         }
 
-        try writeAutoUnattendIfNeeded(config: config, targetMounts: [targetMount])
+        try writeAutoUnattendIfNeeded(config: config, targetMounts: [mountedTarget.path])
 
         Darwin.sync()
         try unmountDisk(blockDev)
-        try? FileManager.default.removeItem(atPath: targetMount)
+        if mountedTarget.isPrivateTempDir {
+            try? FileManager.default.removeItem(atPath: mountedTarget.path)
+        }
         privateMountActive = false
 
-        // Legacy BIOS MBR + NT6 VBR Boot Sector
-        if config.partitionScheme == .mbr {
+        // Legacy BIOS MBR + NT6 VBR Boot Sector (skipped here if Phase 2 will handle it)
+        if config.partitionScheme == .mbr && !config.skipMBRBootSectorWrite {
             stage("Schreibe Windows NT6 MBR & VBR Bootsektor…", fraction: 0.93)
             try writeLegacyBIOSBootSectors(
                 blockDev: blockDev,
@@ -484,8 +517,7 @@ public final class FlashEngine {
             )
         }
 
-        // Remount normally into /Volumes so Finder displays the finished stick cleanly
-        if !config.autoEjectAfterFlash {
+        if !config.skipMBRBootSectorWrite && !config.autoEjectAfterFlash {
             try? mountSliceStandard(slice1)
         }
     }
@@ -529,33 +561,35 @@ public final class FlashEngine {
         stage("Erstelle Dual-Partition (\(scheme): \(bootPartMB) MB FAT32 Boot + ExFAT Daten)…", fraction: 0.12)
         log("Dual-Partition-Layout: \(slice1) = FAT32 (\(bootPartMB) MB, Boot), \(slice2) = ExFAT (Rest, Daten)")
 
+        // Explicit `FAT32` + `ExFAT` directly in diskutil partitionDisk — zero newfs_msdos needed!
         try partitionDiskWithRetry(arguments: [
             "partitionDisk", blockDev, scheme,
-            "MS-DOS", bootLabel, "\(bootPartMB)M",
+            "FAT32", bootLabel, "\(bootPartMB)M",
             "ExFAT", dataLabel, "R"
         ], blockDev: blockDev)
 
-        try unmountDisk(blockDev)
-
-        stage("Formatiere Boot-Partition (FAT32) & Daten-Partition (ExFAT)…", fraction: 0.16)
-        try formatFAT32(sliceDevice: slice1, label: bootLabel, clusterSize: .automatic)
         if config.clusterSize != .automatic {
+            try unmountDisk(blockDev)
+            stage("Formatiere ExFAT mit Clustergröße \(config.clusterSize.rawValue) Bytes…", fraction: 0.16)
             try formatExFAT(sliceDevice: slice2, label: dataLabel, clusterSize: config.clusterSize)
         }
 
-        // Mount both slices into private /private/tmp directories (outside /Volumes TCC & Spotlight!)
-        let bootMount = try mountSlicePrivately(slice1, fsType: "msdos")
-        let dataMount = try mountSlicePrivately(slice2, fsType: "exfat")
+        let bootMounted = try mountSliceForCopy(slice1, blockDev: blockDev, fsType: "msdos")
+        let dataMounted = try mountSliceForCopy(slice2, blockDev: blockDev, fsType: "exfat")
         var privateMountsActive = true
         defer {
             if privateMountsActive {
-                _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", slice1])
-                _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", slice2])
-                try? FileManager.default.removeItem(atPath: bootMount)
-                try? FileManager.default.removeItem(atPath: dataMount)
+                if bootMounted.isPrivateTempDir {
+                    _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", slice1])
+                    try? FileManager.default.removeItem(atPath: bootMounted.path)
+                }
+                if dataMounted.isPrivateTempDir {
+                    _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", slice2])
+                    try? FileManager.default.removeItem(atPath: dataMounted.path)
+                }
             }
         }
-        log("Boot-Partition: \(bootMount) | Daten-Partition: \(dataMount)")
+        log("Boot-Partition: \(bootMounted.path) | Daten-Partition: \(dataMounted.path)")
 
         stage("Kopiere Boot-Dateien auf FAT32-Partition…", fraction: 0.18)
         let bootRatio = max(0.15, min(0.55, Double(bootFilesBytes) / Double(max(1, bootFilesBytes + dataFilesBytes))))
@@ -564,7 +598,7 @@ public final class FlashEngine {
         try copyEntries(
             bootFiles,
             fromRoot: isoMount,
-            toRoot: bootMount,
+            toRoot: bootMounted.path,
             progressStart: 0.18,
             progressEnd: bootEndFrac,
             stageTitle: "Kopiere Boot-Dateien (FAT32)…"
@@ -582,21 +616,21 @@ public final class FlashEngine {
         try copyEntries(
             partition2Entries,
             fromRoot: isoMount,
-            toRoot: dataMount,
+            toRoot: dataMounted.path,
             progressStart: bootEndFrac,
             progressEnd: 0.91,
             stageTitle: "Kopiere install.wim (ExFAT)…"
         )
 
-        try writeAutoUnattendIfNeeded(config: config, targetMounts: [bootMount, dataMount])
+        try writeAutoUnattendIfNeeded(config: config, targetMounts: [bootMounted.path, dataMounted.path])
 
         Darwin.sync()
         try unmountDisk(blockDev)
-        try? FileManager.default.removeItem(atPath: bootMount)
-        try? FileManager.default.removeItem(atPath: dataMount)
+        if bootMounted.isPrivateTempDir { try? FileManager.default.removeItem(atPath: bootMounted.path) }
+        if dataMounted.isPrivateTempDir { try? FileManager.default.removeItem(atPath: dataMounted.path) }
         privateMountsActive = false
 
-        if config.partitionScheme == .mbr {
+        if config.partitionScheme == .mbr && !config.skipMBRBootSectorWrite {
             stage("Schreibe Windows NT6 MBR & FAT32 VBR auf Boot-Partition…", fraction: 0.93)
             try writeLegacyBIOSBootSectors(
                 blockDev: blockDev,
@@ -606,7 +640,7 @@ public final class FlashEngine {
             )
         }
 
-        if !config.autoEjectAfterFlash {
+        if !config.skipMBRBootSectorWrite && !config.autoEjectAfterFlash {
             try? mountSliceStandard(slice1)
             try? mountSliceStandard(slice2)
         }
@@ -622,6 +656,18 @@ public final class FlashEngine {
     ) throws {
         let msSysPath = try resolveHelper(named: "ms-sys", helpersDir: helpersDir)
         try unmountDisk(blockDev)
+
+        // Probe direct raw write permission early to give a crystal-clear Full Disk Access message if denied
+        let probeFD = open(blockDev, O_RDWR)
+        if probeFD < 0 {
+            let errCode = errno
+            let msg = String(cString: strerror(errCode))
+            if errCode == EPERM || errCode == EACCES {
+                throw FlashEngineError.fullDiskAccessRequired("MBR-Bootsektor auf \(blockDev): \(msg)")
+            }
+            throw FlashEngineError.ioError("Kann \(blockDev) nicht für Bootsektor-Schreiben öffnen: \(msg)")
+        }
+        close(probeFD)
 
         let sigValue = UInt32.random(in: 0x10000001...0xFFFFFFFE)
         let sigHex = String(format: "%08X", sigValue)
@@ -646,7 +692,12 @@ public final class FlashEngine {
     private func setMBRPartition1Active(blockDev: String) throws {
         let fd = open(blockDev, O_RDWR)
         guard fd >= 0 else {
-            throw FlashEngineError.ioError("Kann \(blockDev) zum Setzen des Active-Flags nicht öffnen: \(String(cString: strerror(errno)))")
+            let errCode = errno
+            let msg = String(cString: strerror(errCode))
+            if errCode == EPERM || errCode == EACCES {
+                throw FlashEngineError.fullDiskAccessRequired("MBR-Active-Flag auf \(blockDev): \(msg)")
+            }
+            throw FlashEngineError.ioError("Kann \(blockDev) zum Setzen des Active-Flags nicht öffnen: \(msg)")
         }
         defer { close(fd) }
 
@@ -886,29 +937,46 @@ public final class FlashEngine {
 
     // MARK: - Low-Level Disk Helpers
 
-    private func wipeDiskHeaders(rawDev: String, diskSizeBytes: Int64) throws {
-        let fd = open(rawDev, O_WRONLY)
-        guard fd >= 0 else {
-            throw FlashEngineError.ioError("Kann \(rawDev) zum Löschen nicht öffnen: \(String(cString: strerror(errno)))")
-        }
-        defer { close(fd) }
+    private struct MountedSlice {
+        let path: String
+        let isPrivateTempDir: Bool
+    }
 
-        let zeroChunkSize = 1024 * 1024
-        let zeros = UnsafeMutableRawPointer.allocate(byteCount: zeroChunkSize, alignment: 4096)
-        defer { zeros.deallocate() }
-        memset(zeros, 0, zeroChunkSize)
+    /// Mounts a target slice into a clean private `/private/tmp/rufusmac-dst-<UUID>` directory (avoiding Spotlight locks),
+    /// or smoothly falls back to the standard `/Volumes/<LABEL>` mountpoint if needed.
+    private func mountSliceForCopy(_ sliceDevice: String, blockDev: String, fsType: String) throws -> MountedSlice {
+        // First unmount slice if partitionDisk auto-mounted it into /Volumes
+        _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmount", "force", sliceDevice])
 
-        let headMB = min(4, max(1, Int(diskSizeBytes / Int64(zeroChunkSize))))
-        for i in 0..<headMB {
-            _ = pwrite(fd, zeros, zeroChunkSize, off_t(i * zeroChunkSize))
+        let mountDir = "/private/tmp/rufusmac-dst-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(
+            atPath: mountDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+
+        // Try private /private/tmp mountpoint first (works without root on macOS!)
+        for attempt in 1...2 {
+            if (try? runCommand("/usr/sbin/diskutil", arguments: ["mount", "-mountPoint", mountDir, sliceDevice])) != nil {
+                return MountedSlice(path: mountDir, isPrivateTempDir: true)
+            }
+            if attempt == 1 { Thread.sleep(forTimeInterval: 0.4) }
         }
 
-        if diskSizeBytes > Int64(zeroChunkSize * 2) {
-            let tailOffset = ((diskSizeBytes - Int64(zeroChunkSize)) / 512) * 512
-            _ = pwrite(fd, zeros, zeroChunkSize, off_t(tailOffset))
+        // If running as root, try /sbin/mount directly
+        if geteuid() == 0 {
+            if (try? runCommand("/sbin/mount", arguments: ["-t", fsType, "-o", "nobrowse,noatime", sliceDevice, mountDir])) != nil {
+                return MountedSlice(path: mountDir, isPrivateTempDir: true)
+            }
         }
-        _ = fsync(fd)
-        log("Anfangs- und Endsektoren (MBR/GPT/UDF-Reste) erfolgreich gelöscht.")
+
+        // Clean fallback: standard diskutil mount (/Volumes/<LABEL>)
+        try? FileManager.default.removeItem(atPath: mountDir)
+        try mountSliceStandard(sliceDevice)
+        let mp = try waitForMountPoint(sliceDevice: sliceDevice)
+        let marker = (mp as NSString).appendingPathComponent(".metadata_never_index")
+        FileManager.default.createFile(atPath: marker, contents: Data())
+        return MountedSlice(path: mp, isPrivateTempDir: false)
     }
 
     private func partitionDiskWithRetry(arguments: [String], blockDev: String) throws {
@@ -931,7 +999,11 @@ public final class FlashEngine {
             args.append(contentsOf: ["-b", "\(clusterSize.rawValue)"])
         }
         args.append(sliceDevice)
-        try runCommand("/sbin/newfs_msdos", arguments: args)
+        do {
+            try runCommand("/sbin/newfs_msdos", arguments: args)
+        } catch let FlashEngineError.commandFailed(_, details) where details.localizedCaseInsensitiveContains("Operation not permitted") {
+            throw FlashEngineError.fullDiskAccessRequired("Benutzerdefinierte Clustergröße (newfs_msdos): \(details)")
+        }
     }
 
     private func formatExFAT(sliceDevice: String, label: String, clusterSize: ClusterSize) throws {
@@ -940,7 +1012,11 @@ public final class FlashEngine {
             args.append(contentsOf: ["-b", "\(clusterSize.rawValue)"])
         }
         args.append(sliceDevice)
-        try runCommand("/sbin/newfs_exfat", arguments: args)
+        do {
+            try runCommand("/sbin/newfs_exfat", arguments: args)
+        } catch let FlashEngineError.commandFailed(_, details) where details.localizedCaseInsensitiveContains("Operation not permitted") {
+            throw FlashEngineError.fullDiskAccessRequired("Benutzerdefinierte Clustergröße (newfs_exfat): \(details)")
+        }
     }
 
     private func unmountDisk(_ blockDev: String) throws {
@@ -955,35 +1031,6 @@ public final class FlashEngine {
         }
     }
 
-    /// Mounts a target slice onto a canonical `/private/tmp/rufusmac-dst-<UUID>` mountpoint so macOS TCC's `/Volumes/`
-    /// removable-volume guard and Spotlight never interfere during flashing.
-    /// Falls back directly to `/sbin/mount -t <msdos|exfat>` if diskarbitrationd is busy.
-    private func mountSlicePrivately(_ sliceDevice: String, fsType: String = "msdos") throws -> String {
-        let mountDir = "/private/tmp/rufusmac-dst-\(UUID().uuidString)"
-        try FileManager.default.createDirectory(
-            atPath: mountDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o755]
-        )
-        for attempt in 1...4 {
-            do {
-                if attempt <= 2 {
-                    try runCommand("/usr/sbin/diskutil", arguments: ["mount", "-mountPoint", mountDir, sliceDevice])
-                } else {
-                    try runCommand("/sbin/mount", arguments: ["-t", fsType, "-o", "nobrowse,noatime", sliceDevice, mountDir])
-                }
-                return mountDir
-            } catch {
-                if attempt == 4 {
-                    try? FileManager.default.removeItem(atPath: mountDir)
-                    throw error
-                }
-                Thread.sleep(forTimeInterval: 0.6)
-            }
-        }
-        throw FlashEngineError.mountPointNotFound(sliceDevice)
-    }
-
     private func mountSliceStandard(_ sliceDevice: String) throws {
         for attempt in 1...4 {
             do {
@@ -994,6 +1041,18 @@ public final class FlashEngine {
                 Thread.sleep(forTimeInterval: 0.5)
             }
         }
+    }
+
+    private func waitForMountPoint(sliceDevice: String) throws -> String {
+        for _ in 1...15 {
+            if let data = try? DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", sliceDevice]),
+               let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+               let mp = dict["MountPoint"] as? String, !mp.isEmpty {
+                return mp
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        throw FlashEngineError.mountPointNotFound(sliceDevice)
     }
 
     private func queryDiskSizeBytes(deviceNode: String) throws -> Int64 {

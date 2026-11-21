@@ -18,7 +18,8 @@ let package = Package(
             path: "Sources/RufusCore",
             linkerSettings: [
                 .linkedFramework("DiskArbitration"),
-                .linkedFramework("IOKit")
+                .linkedFramework("IOKit"),
+                .linkedFramework("Security")
             ]
         ),
         .executableTarget(

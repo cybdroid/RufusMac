@@ -19,17 +19,32 @@ struct ProgressFooterView: View {
 
                     Spacer(minLength: 8)
 
-                    if isFailedState && !vm.showLogDrawer {
-                        Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
-                                vm.showLogDrawer = true
+                    if isFailedState {
+                        HStack(spacing: 6) {
+                            if vm.needsFullDiskAccessPrompt {
+                                Button {
+                                    vm.openFullDiskAccessSettings()
+                                } label: {
+                                    Label(vm.t("Einstellungen öffnen", "Open Settings"), systemImage: "lock.open.fill")
+                                        .font(.system(size: 11, weight: .semibold))
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(RufusTheme.accentAmber)
+                                .controlSize(.small)
                             }
-                        } label: {
-                            Label(vm.t("Protokoll", "Log"), systemImage: "terminal")
-                                .font(.system(size: 11, weight: .medium))
+                            if !vm.showLogDrawer {
+                                Button {
+                                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                                        vm.showLogDrawer = true
+                                    }
+                                } label: {
+                                    Label(vm.t("Protokoll", "Log"), systemImage: "terminal")
+                                        .font(.system(size: 11, weight: .medium))
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
 
                     if vm.isRunning {

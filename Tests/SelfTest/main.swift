@@ -74,6 +74,7 @@ runTest("Whole disk identifier parsing") {
 // 3. Volume label sanitizer
 runTest("Volume label sanitizer (FAT32 / ExFAT / APFS)") {
     try assertEqual(VolumeLabelSanitizer.sanitize("Windows 11 x64 DE!", for: .fat32), "WINDOWS 11")
+    try assertEqual(VolumeLabelSanitizer.sanitize("Win10_22H2_German_x64v1", for: .fat32), "WIN10_22H2")
     try assertEqual(VolumeLabelSanitizer.sanitize("cccoma_x64fre_de-de", for: .fat32), "CCCOMA_X64F")
     try assertEqual(VolumeLabelSanitizer.sanitize("   ", for: .fat32), "RUFUSMAC")
     try assertEqual(VolumeLabelSanitizer.sanitize("Win11:Pro/Test", for: .exfat), "Win11ProTest")
@@ -201,12 +202,31 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     let inspected = try ISOInspector.inspect(filePath: isoURL.path)
     try assertEqual(inspected.kind, .windowsISO)
 
-    // Create 384 MB raw virtual disk
+    // Create 384 MB raw virtual disk pre-filled with raw UDF Windows ISO at sector 0 (simulating Balena Etcher!)
     let vdiskURL = workDir.appendingPathComponent("virtual_usb.img")
-    FileManager.default.createFile(atPath: vdiskURL.path, contents: nil)
+    try FileManager.default.copyItem(at: isoURL, to: vdiskURL)
     let vfh = try FileHandle(forWritingTo: vdiskURL)
     try vfh.truncate(atOffset: 384 * 1024 * 1024)
     try vfh.close()
+
+    // Verify GPT FAT32 and Dual-Partition require ZERO root privileges!
+    let sampleGPTConfig = FlashJobConfig(
+        targetDeviceIdentifier: "disk99",
+        bootMode: .isoOrImage,
+        writeMode: .isoFileCopy,
+        isoPath: isoURL.path,
+        isoKind: .windowsISO,
+        partitionScheme: .gpt,
+        fileSystem: .fat32,
+        volumeLabel: "WIN10_22H2",
+        clusterSize: .automatic,
+        quickFormat: true,
+        wipePartitionTable: true,
+        autoEjectAfterFlash: false,
+        windowsOptions: WindowsCustomizationOptions()
+    )
+    try assertTrue(!FlashEngine.requiresRootForWholeJob(sampleGPTConfig), "GPT FAT32 must NOT require root!")
+    try assertTrue(!FlashEngine.needsMBRBootSectorPhase2(sampleGPTConfig), "GPT FAT32 must NOT require MBR phase 2!")
 
     let attachOut = try DiskDiscovery.runProcess("/usr/bin/hdiutil", arguments: [
         "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", vdiskURL.path
