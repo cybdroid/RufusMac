@@ -202,11 +202,11 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     let inspected = try ISOInspector.inspect(filePath: isoURL.path)
     try assertEqual(inspected.kind, .windowsISO)
 
-    // Create 384 MB raw virtual disk pre-filled with raw UDF Windows ISO at sector 0 (simulating Balena Etcher!)
+    // Create 2 GB sparse virtual disk pre-filled with raw UDF Windows ISO at sector 0 (simulating Balena Etcher on a real >1 GB USB stick where macOS GPT creates s1=EFI + s2=Data!)
     let vdiskURL = workDir.appendingPathComponent("virtual_usb.img")
     try FileManager.default.copyItem(at: isoURL, to: vdiskURL)
     let vfh = try FileHandle(forWritingTo: vdiskURL)
-    try vfh.truncate(atOffset: 384 * 1024 * 1024)
+    try vfh.truncate(atOffset: 2 * 1024 * 1024 * 1024)
     try vfh.close()
 
     // Verify GPT FAT32 and Dual-Partition require ZERO root privileges!
@@ -244,7 +244,8 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     try assertEqual(preMounted.volumeName, "WIN11_TEST", "Real UDF VolumeName must be extracted, not temp dir name!")
 
     var eventsA: [FlashProgressEvent] = []
-    try FlashEngine(emit: { eventsA.append($0) }, isCancelled: { false }).execute(config: FlashJobConfig(
+    let engineA = FlashEngine(emit: { eventsA.append($0) }, isCancelled: { false })
+    try engineA.execute(config: FlashJobConfig(
         targetDeviceIdentifier: diskId,
         bootMode: .isoOrImage,
         writeMode: .isoFileCopy,
@@ -263,16 +264,28 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
         allowDiskImageTarget: true
     ))
     try assertTrue(eventsA.contains { $0.kind == .completed }, "GPT FAT32 did not complete")
-    let infoA = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", "\(devNode)s1"])
-    let mountA = ((try PropertyListSerialization.propertyList(from: infoA, format: nil) as? [String: Any])?["MountPoint"] as? String) ?? ""
+    let slicesA = try engineA.discoverDataPartitionSlices(for: devNode, expectedMinimum: 1)
+    try assertEqual(slicesA.count, 1, "Expected 1 data partition on single-partition GPT")
+    let infoA = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", slicesA[0]])
+    let dictA = (try PropertyListSerialization.propertyList(from: infoA, format: nil) as? [String: Any]) ?? [:]
+    try assertTrue((dictA["Content"] as? String) != "EFI", "Data slice must NEVER be EFI!")
+    let mountA = (dictA["MountPoint"] as? String) ?? ""
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/efi/boot/bootx64.efi"), "Missing bootx64.efi on GPT FAT32")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/sources/install.wim"), "Missing install.wim on GPT FAT32")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountA)/autounattend.xml"), "Missing autounattend.xml on GPT FAT32")
-    print("         [sub-check] GPT + FAT32 + preMountedISOPath + autounattend.xml OK")
+    print("         [sub-check] 2GB GPT (\(slicesA[0])=FAT32) + preMountedISOPath + autounattend.xml OK")
+
+    // Also verify read-only EFI-skipping on real physical GPT disk if disk6 currently has EFI+Data
+    if let realSlices = try? engineA.discoverDataPartitionSlices(for: "/dev/disk6", expectedMinimum: 1),
+       realSlices.contains("/dev/disk6s2") {
+        try assertTrue(!realSlices.contains("/dev/disk6s1"), "EFI partition disk6s1 must be skipped!")
+        print("         [sub-check] Real physical GPT /dev/disk6 EFI-skip verified -> \(realSlices)")
+    }
 
     // B) GPT Dual-Partition (FAT32 Boot + ExFAT Data)
     var eventsB: [FlashProgressEvent] = []
-    try FlashEngine(emit: { eventsB.append($0) }, isCancelled: { false }).execute(config: FlashJobConfig(
+    let engineB = FlashEngine(emit: { eventsB.append($0) }, isCancelled: { false })
+    try engineB.execute(config: FlashJobConfig(
         targetDeviceIdentifier: diskId,
         bootMode: .isoOrImage,
         writeMode: .isoFileCopy,
@@ -290,8 +303,10 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
         allowDiskImageTarget: true
     ))
     try assertTrue(eventsB.contains { $0.kind == .completed }, "Dual-Partition did not complete")
-    let infoB1 = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", "\(devNode)s1"])
-    let infoB2 = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", "\(devNode)s2"])
+    let slicesB = try engineB.discoverDataPartitionSlices(for: devNode, expectedMinimum: 2)
+    try assertEqual(slicesB.count, 2, "Expected 2 data partitions on Dual-Partition GPT")
+    let infoB1 = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", slicesB[0]])
+    let infoB2 = try DiskDiscovery.runProcess("/usr/sbin/diskutil", arguments: ["info", "-plist", slicesB[1]])
     let mountB1 = ((try PropertyListSerialization.propertyList(from: infoB1, format: nil) as? [String: Any])?["MountPoint"] as? String) ?? ""
     let mountB2 = ((try PropertyListSerialization.propertyList(from: infoB2, format: nil) as? [String: Any])?["MountPoint"] as? String) ?? ""
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountB1)/efi/boot/bootx64.efi"), "Missing bootx64.efi on Boot FAT32")
@@ -299,7 +314,7 @@ runTest("End-to-End Virtual Disk Flashing: GPT FAT32, GPT Dual-Partition, MBR NT
     try assertTrue(!FileManager.default.fileExists(atPath: "\(mountB1)/sources/install.wim"), "install.wim should be excluded from FAT32 boot partition")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountB2)/sources/install.wim"), "Missing install.wim on ExFAT data partition")
     try assertTrue(FileManager.default.fileExists(atPath: "\(mountB2)/autounattend.xml"), "Missing autounattend.xml on ExFAT data partition")
-    print("         [sub-check] GPT Dual-Partition (FAT32 Boot + ExFAT Data) OK")
+    print("         [sub-check] 2GB GPT Dual-Partition (\(slicesB[0])=FAT32 Boot, \(slicesB[1])=ExFAT Data) OK")
 
     // C) MBR + FAT32 + Windows NT6 MBR/VBR + Active Flag 0x80
     var eventsC: [FlashProgressEvent] = []
