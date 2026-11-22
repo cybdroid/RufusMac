@@ -652,20 +652,33 @@ public final class FlashEngine {
         let sigHex = String(format: "%08X", sigValue)
 
         log("Schreibe Windows NT6/10/11 MBR + Disk-Signatur 0x\(sigHex) auf \(blockDev)…")
-        try runCommand(msSysPath, arguments: ["-7", "-S", sigHex, "-f", blockDev])
+        try runMsSysWithRetry(msSysPath, arguments: ["-7", "-S", sigHex, "-f", blockDev], blockDev: blockDev)
 
         if bootFS == .exfat {
             log("Schreibe Windows NT6 ExFAT BOOTMGR-VBR auf \(bootSlice)…")
-            try runCommand(msSysPath, arguments: ["-x", "-p", "-f", bootSlice])
+            try runMsSysWithRetry(msSysPath, arguments: ["-x", "-p", "-f", bootSlice], blockDev: blockDev)
         } else {
             log("Schreibe Windows NT6 FAT32 BOOTMGR-VBR auf \(bootSlice)…")
-            try runCommand(msSysPath, arguments: ["-8", "-p", "-f", bootSlice])
+            try runMsSysWithRetry(msSysPath, arguments: ["-8", "-p", "-f", bootSlice], blockDev: blockDev)
         }
 
         log("Setze Aktiv/Boot-Flag (0x80) für Partition 1 im MBR…")
         try setMBRPartition1Active(blockDev: blockDev)
         Darwin.sync()
         log("Legacy BIOS MBR + VBR Bootsektoren erfolgreich geschrieben und verifiziert.")
+    }
+
+    private func runMsSysWithRetry(_ msSysPath: String, arguments: [String], blockDev: String) throws {
+        for attempt in 1...3 {
+            do {
+                try runCommand(msSysPath, arguments: arguments)
+                return
+            } catch {
+                if attempt == 3 { throw error }
+                _ = try? runCommand("/usr/sbin/diskutil", arguments: ["unmountDisk", "force", blockDev])
+                Thread.sleep(forTimeInterval: 0.6)
+            }
+        }
     }
 
     private func setMBRPartition1Active(blockDev: String) throws {
@@ -962,12 +975,27 @@ public final class FlashEngine {
 
     private func writeAutoUnattendIfNeeded(config: FlashJobConfig, targetMounts: [String]) throws {
         guard config.isoKind == .windowsISO || config.windowsOptions.isAnyEnabled else { return }
-        guard let xml = AutoUnattendGenerator.generate(options: config.windowsOptions) else { return }
+        guard let plan = AutoUnattendGenerator.generatePlan(options: config.windowsOptions) else { return }
 
+        let fm = FileManager.default
         for mount in targetMounts {
-            let dest = (mount as NSString).appendingPathComponent("autounattend.xml")
-            try xml.write(toFile: dest, atomically: true, encoding: .utf8)
+            let dest = (mount as NSString).appendingPathComponent(plan.relativePath)
+            let parentDir = (dest as NSString).deletingLastPathComponent
+            try fm.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+            try plan.xmlContent.write(toFile: dest, atomically: true, encoding: .utf8)
             log("Windows-Anpassung geschrieben: \(dest)")
+
+            // Also apply Rufus's appraiserres.dll placeholder bypass when TPM/SecureBoot bypass is enabled
+            if plan.shouldPatchAppraiserRes {
+                let appraiserSrc = (mount as NSString).appendingPathComponent("sources/appraiserres.dll")
+                let appraiserBak = (mount as NSString).appendingPathComponent("sources/appraiserres.bak")
+                if fm.fileExists(atPath: appraiserSrc) {
+                    try? fm.removeItem(atPath: appraiserBak)
+                    try? fm.moveItem(atPath: appraiserSrc, toPath: appraiserBak)
+                    fm.createFile(atPath: appraiserSrc, contents: Data())
+                    log("Windows-11-Hardwareprüfung entschärft: sources/appraiserres.dll -> .bak (Platzhalter erstellt)")
+                }
+            }
         }
     }
 

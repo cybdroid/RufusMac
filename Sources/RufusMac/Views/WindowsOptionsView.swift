@@ -10,16 +10,30 @@ struct WindowsOptionsView: View {
             iconColor: RufusTheme.accentBlue,
             trailing: {
                 if vm.windowsOptions.isAnyEnabled {
-                    StatusPill("autounattend.xml", icon: "doc.badge.gearshape.fill", color: RufusTheme.accentBlue)
+                    StatusPill(
+                        vm.windowsOptions.bypassHardwareChecks ? "autounattend.xml" : "Panther/unattend.xml",
+                        icon: "doc.badge.gearshape.fill",
+                        color: RufusTheme.accentBlue
+                    )
                 }
             }
         ) {
             VStack(alignment: .leading, spacing: 9) {
                 Toggle(isOn: $vm.windowsOptions.bypassHardwareChecks) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(vm.t("TPM 2.0, Secure Boot & 4 GB RAM-Prüfung entfernen", "Remove requirement for 4GB+ RAM, Secure Boot and TPM 2.0"))
-                            .font(.system(size: 12, weight: .medium))
-                        Text(vm.t("Ermöglicht Windows 11 Installation auf älterer Hardware (LabConfig).", "Allows installing Windows 11 on unsupported hardware (LabConfig)."))
+                        HStack(spacing: 6) {
+                            Text(vm.t("TPM 2.0, Secure Boot & 4 GB RAM-Prüfung entfernen", "Remove requirement for 4GB+ RAM, Secure Boot and TPM 2.0"))
+                                .font(.system(size: 12, weight: .medium))
+                            if vm.isoAnalysis?.isWindows11Likely == false {
+                                Text(vm.t("Nur Win 11", "Win 11 only"))
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1.5)
+                                    .background(Capsule().fill(Color.secondary.opacity(0.16)))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text(vm.t("Ermöglicht Windows 11 Installation auf älterer Hardware (LabConfig + ProductKey-Safe).", "Allows installing Windows 11 on unsupported hardware (LabConfig + ProductKey-Safe)."))
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
                     }

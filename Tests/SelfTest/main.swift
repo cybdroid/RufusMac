@@ -82,27 +82,52 @@ runTest("Volume label sanitizer (FAT32 / ExFAT / APFS)") {
 }
 
 // 4. AutoUnattend XML generator
-runTest("AutoUnattend XML generation (TPM/SecureBoot/RAM + BypassNRO + Privacy)") {
-    try assertTrue(AutoUnattendGenerator.generate(options: WindowsCustomizationOptions()) == nil, "Empty options should return nil")
+runTest("AutoUnattend XML generation (ProductKey-safe WinPE + Panther/unattend.xml + BypassNRO + Privacy)") {
+    try assertTrue(AutoUnattendGenerator.generatePlan(options: WindowsCustomizationOptions()) == nil, "Empty options should return nil")
 
-    let opts = WindowsCustomizationOptions(
+    // Case A: Hardware bypass enabled -> root autounattend.xml WITH mandatory ProductKey block + AcceptEula!
+    let optsWithBypass = WindowsCustomizationOptions(
         bypassHardwareChecks: true,
         bypassMicrosoftAccount: true,
-        localAccountUsername: "Jonas & Admin",
+        localAccountUsername: "Jonas & User",
         disablePrivacyQuestions: true
     )
-    guard let xml = AutoUnattendGenerator.generate(options: opts) else {
-        throw TestFailure(description: "Expected non-nil XML")
+    guard let planA = AutoUnattendGenerator.generatePlan(options: optsWithBypass) else {
+        throw TestFailure(description: "Expected non-nil planA")
     }
+    try assertEqual(planA.relativePath, "autounattend.xml")
+    try assertTrue(planA.shouldPatchAppraiserRes, "Should patch appraiserres.dll when bypassHardwareChecks is enabled")
+    let xml = planA.xmlContent
+    try assertTrue(xml.contains("<AcceptEula>true</AcceptEula>"), "Missing AcceptEula in windowsPE UserData")
+    try assertTrue(xml.contains("<ProductKey>"), "Missing mandatory ProductKey block in windowsPE (causes Setup reboot error!)")
+    try assertTrue(xml.contains("<Key></Key>"), "Missing empty <Key></Key> element inside ProductKey")
+    try assertTrue(xml.contains("<WillShowUI>OnError</WillShowUI>"), "Missing WillShowUI OnError inside ProductKey")
     try assertTrue(xml.contains("BypassTPMCheck"), "Missing BypassTPMCheck")
     try assertTrue(xml.contains("BypassSecureBootCheck"), "Missing BypassSecureBootCheck")
     try assertTrue(xml.contains("BypassRAMCheck"), "Missing BypassRAMCheck")
     try assertTrue(xml.contains("BypassNRO"), "Missing BypassNRO")
-    try assertTrue(xml.contains("<Name>Jonas &amp; Admin</Name>"), "XML escaping failed")
+    try assertTrue(xml.contains("<Name>Jonas &amp; User</Name>"), "XML escaping failed")
+    try assertTrue(xml.contains("UABhAHMAcwB3AG8AcgBkAA=="), "Missing official Microsoft Base64 blank password")
     try assertTrue(xml.contains("<ProtectYourPC>3</ProtectYourPC>"), "Missing ProtectYourPC")
 
-    let doc = try XMLDocument(xmlString: xml, options: [])
-    try assertEqual(doc.rootElement()?.name ?? "", "unattend")
+    let docA = try XMLDocument(xmlString: xml, options: [])
+    try assertEqual(docA.rootElement()?.name ?? "", "unattend")
+
+    // Case B: OOBE/Privacy only (no WinPE hardware bypass) -> sources/$OEM$/$$/Panther/unattend.xml with NO windowsPE pass!
+    let optsOobeOnly = WindowsCustomizationOptions(
+        bypassHardwareChecks: false,
+        bypassMicrosoftAccount: true,
+        localAccountUsername: "Jonas",
+        disablePrivacyQuestions: true
+    )
+    guard let planB = AutoUnattendGenerator.generatePlan(options: optsOobeOnly) else {
+        throw TestFailure(description: "Expected non-nil planB")
+    }
+    try assertEqual(planB.relativePath, "sources/$OEM$/$$/Panther/unattend.xml")
+    try assertTrue(!planB.shouldPatchAppraiserRes, "Should NOT patch appraiserres.dll when bypassHardwareChecks is false")
+    try assertTrue(!planB.xmlContent.contains("pass=\"windowsPE\""), "Must NOT include windowsPE pass when bypassHardwareChecks is false")
+    let docB = try XMLDocument(xmlString: planB.xmlContent, options: [])
+    try assertEqual(docB.rootElement()?.name ?? "", "unattend")
 }
 
 // 5. ISO Inspector & Streaming Checksums

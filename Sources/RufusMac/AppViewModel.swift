@@ -274,6 +274,10 @@ final class AppViewModel: ObservableObject {
             }
             partitionScheme = .gpt
             volumeLabel = VolumeLabelSanitizer.sanitize(rawLabel, for: fileSystem)
+            // Windows 10 does not have TPM 2.0 / Secure Boot requirements — keep hardware bypass off by default for Win10
+            if !analysis.isWindows11Likely {
+                windowsOptions.bypassHardwareChecks = false
+            }
         } else if analysis.kind == .rawDiskImage {
             writeMode = .ddRawImage
             volumeLabel = VolumeLabelSanitizer.sanitize(rawLabel, for: fileSystem)
